@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## [0.9.1-shuv.4] - 2026-09-26
+
+### Fixed
+- Direct terminal controllers now yield to desktop shell focus, pane selection, or pane input, restoring desktop geometry and notifying the controller with the existing takeover shutdown. Observers remain connected and phones can reclaim with `control --takeover`.
+
+### Added
+- Advertise `direct_control_yields_to_shell` in server capabilities and endpoint/client capability lists.
+- Fork build identity: Cargo base `0.9.1`, built with `HERDR_FORK_REVISION=4`, following shuv.1 through shuv.3. No tag or release is published by this change.
+
 ## [0.9.1] - 2026-09-16
 
 ### Added

@@ -1,5 +1,7 @@
 use super::*;
 
+mod direct_control;
+
 #[path = "pane_graphics.rs"]
 mod pane_graphics_tests;
 #[path = "pane_move.rs"]

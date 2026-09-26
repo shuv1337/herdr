@@ -22,6 +22,9 @@ pub struct ServerSshAgentRegisterParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
     pub live_handoff: bool,
+    /// Direct controllers yield to explicit shell focus/selection and pane input.
+    #[serde(default)]
+    pub direct_control_yields_to_shell: bool,
     #[serde(default)]
     pub detached_server_daemon: bool,
     /// Stable client-owned endpoint generation supported by this server.

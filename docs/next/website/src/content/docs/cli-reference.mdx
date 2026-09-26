@@ -378,6 +378,9 @@ terminal, or agent target. It prints the same newline-delimited
 newline-delimited JSON commands on stdin: `terminal.input`, `terminal.resize`,
 `terminal.scroll`, and `terminal.release`. One controller can own a terminal at
 a time; use `--takeover` to replace it.
+
+When `status server --json` reports `capabilities.direct_control_yields_to_shell: true`, an active Herdr shell reclaims a pane on explicit focus/selection or pane input. The direct controller receives `terminal.closed` with reason `terminal attach taken over`, its resize lock is removed, and shell geometry is restored. Observers stay connected. Passive shell resize, rendering, and focus loss do not reclaim control. Open a new `control --takeover` stream to control the pane again.
+
 `terminal session observe` opens a read-only live terminal stream for a pane,
 terminal, or agent target. It prints newline-delimited JSON `terminal.frame`
 records with base64-encoded ANSI bytes, then a `terminal.closed` record when

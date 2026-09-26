@@ -915,8 +915,23 @@ impl HeadlessServer {
     pub(super) fn handle_client_shell_api_request(
         &mut self,
         client_id: u64,
-        msg: api::ApiRequestMessage,
+        mut msg: api::ApiRequestMessage,
     ) -> bool {
+        // Explicit selection must also reclaim an already-selected pane. Inspect the
+        // result so rejected focus commands cannot evict an unrelated controller.
+        let explicit_focus = matches!(
+            &msg.request.method,
+            api::schema::Method::PaneFocus(_)
+                | api::schema::Method::PaneFocusDirection(_)
+                | api::schema::Method::AgentFocus(_)
+                | api::schema::Method::TabFocus(_)
+                | api::schema::Method::WorkspaceFocus(_)
+        );
+        let response_proxy = explicit_focus.then(|| {
+            let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
+            let original = std::mem::replace(&mut msg.respond_to, proxy_tx);
+            (original, proxy_rx)
+        });
         let focus_before = self.shell_focus_target(client_id);
         let focused_tabs_before = self.focused_shell_tabs();
         let method_claims_geometry = Self::shell_endpoint_claims_geometry(&msg.request.method);
@@ -928,6 +943,7 @@ impl HeadlessServer {
         let popup_before = self.app.state.popup_pane.is_some();
         let popup_owner = self.shell_tab_id_for_client(client_id);
         let changed = self.handle_api_request_with_shutdown_check_inner(msg, false);
+        let focus_succeeded = forward_proxied_api_response(response_proxy).is_some();
         self.focus_shell_client_on_default_target(client_id);
         if !popup_before && self.app.state.popup_pane.is_some() {
             self.popup_owner_tab_id = popup_owner;
@@ -936,6 +952,8 @@ impl HeadlessServer {
             self.reconcile_client_shell_locations();
         }
         let focus_after = self.shell_focus_target(client_id);
+        let reclaimed = (focus_succeeded || focus_before != focus_after)
+            && self.reclaim_direct_control_for_shell_focus(client_id);
         if let Some(all_focus_before) = all_focus_before {
             self.finish_shell_location_reconciliation(all_focus_before, &focused_tabs_before);
         } else {
@@ -961,6 +979,6 @@ impl HeadlessServer {
                 self.claim_shell_tab_geometry(client_id, false)
                     || self.resize_shell_tab_if_controller(client_id, false)
             };
-        changed | navigation_changed | geometry_changed
+        reclaimed | changed | navigation_changed | geometry_changed
     }
 }

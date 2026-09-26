@@ -278,6 +278,7 @@ struct ServerStatusJson {
 #[derive(Serialize)]
 struct ServerCapabilitiesJson {
     live_handoff: bool,
+    direct_control_yields_to_shell: bool,
     detached_server_daemon: bool,
     endpoint_protocol_generation: Option<u32>,
     surface_interest: bool,
@@ -302,6 +303,7 @@ fn client_status_json() -> ClientStatusJson {
             crate::protocol::endpoint::SURFACE_INTEREST_CAPABILITY,
             crate::protocol::endpoint::PRESENTATION_EFFECTS_FENCE_CAPABILITY,
             crate::protocol::endpoint::HEALTH_CHECK_CAPABILITY,
+            crate::protocol::endpoint::DIRECT_CONTROL_YIELDS_TO_SHELL_CAPABILITY,
         ],
         remote_host_bridge: true,
         remote_bridge_idle_timeout: crate::platform::REMOTE_BRIDGE_IDLE_TIMEOUT_SUPPORTED,
@@ -325,6 +327,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                 .as_ref()
                 .map(|capabilities| ServerCapabilitiesJson {
                     live_handoff: capabilities.live_handoff,
+                    direct_control_yields_to_shell: capabilities.direct_control_yields_to_shell,
                     detached_server_daemon: capabilities.detached_server_daemon,
                     endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
                     surface_interest: capabilities.surface_interest,
@@ -423,6 +426,7 @@ mod tests {
             protocol: Some(crate::protocol::PROTOCOL_VERSION),
             capabilities: Some(crate::api::schema::ServerCapabilities {
                 live_handoff: true,
+                direct_control_yields_to_shell: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
@@ -437,6 +441,10 @@ mod tests {
         let server = running_server(Some("test"), None);
         let value = serde_json::to_value(server_status_json(&server)).unwrap();
         assert_eq!(value["capabilities"]["ssh_agent_registration"], false);
+        assert_eq!(
+            value["capabilities"]["direct_control_yields_to_shell"],
+            true
+        );
     }
 
     #[test]

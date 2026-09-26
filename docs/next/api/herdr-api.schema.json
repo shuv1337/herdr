@@ -10660,6 +10660,11 @@
               "default": false,
               "type": "boolean"
             },
+            "direct_control_yields_to_shell": {
+              "default": false,
+              "description": "Direct controllers yield to explicit shell focus/selection and pane input.",
+              "type": "boolean"
+            },
             "endpoint_protocol_generation": {
               "description": "Stable client-owned endpoint generation supported by this server.",
               "format": "uint32",

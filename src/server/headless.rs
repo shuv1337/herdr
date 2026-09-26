@@ -1109,6 +1109,64 @@ impl HeadlessServer {
         }
     }
 
+    /// Reuse direct takeover teardown so observers and shell clients stay connected.
+    fn take_over_direct_terminal(&mut self, terminal_id: &str) -> bool {
+        let Some(owner) = self.terminal_attach_owners.get(terminal_id).copied() else {
+            return false;
+        };
+        self.send_to_client(
+            owner,
+            ServerMessage::ServerShutdown {
+                reason: Some("terminal attach taken over".to_owned()),
+            },
+        );
+        self.remove_client_and_resize_if_needed(owner);
+        true
+    }
+
+    fn reclaim_direct_control_for_shell_pane(
+        &mut self,
+        client_id: u64,
+        workspace_index: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> bool {
+        if self.handoff_in_progress
+            || self.terminal_attach_owners.is_empty()
+            || !self
+                .clients
+                .get(&client_id)
+                .is_some_and(ClientConnection::is_active_shell_client)
+            || !self.shell_client_views_pane(client_id, workspace_index, pane_id)
+        {
+            return false;
+        }
+        let Some(terminal_id) = self
+            .app
+            .state
+            .workspaces
+            .get(workspace_index)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .map(ToString::to_string)
+        else {
+            return false;
+        };
+        self.take_over_direct_terminal(&terminal_id)
+    }
+
+    fn reclaim_direct_control_for_shell_focus(&mut self, client_id: u64) -> bool {
+        if self.terminal_attach_owners.is_empty() {
+            return false;
+        }
+        let Some(target) = self.shell_focus_target(client_id) else {
+            return false;
+        };
+        self.reclaim_direct_control_for_shell_pane(
+            client_id,
+            target.workspace_index,
+            target.pane_id,
+        )
+    }
+
     /// Accepts pending client connections from the non-blocking listener.
     #[cfg(unix)]
     fn accept_client_connections(&mut self) -> io::Result<()> {
@@ -1288,6 +1346,11 @@ impl HeadlessServer {
                 {
                     return false;
                 }
+                let reclaimed = self.reclaim_direct_control_for_shell_pane(
+                    client_id,
+                    workspace_index,
+                    runtime_pane_id,
+                );
                 let foreground_changed = self.promote_client_to_foreground(client_id);
                 let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
@@ -1295,7 +1358,7 @@ impl HeadlessServer {
                     workspace_index,
                     runtime_pane_id,
                 ) else {
-                    return foreground_changed | geometry_changed;
+                    return reclaimed | foreground_changed | geometry_changed;
                 };
                 if let Err(err) = apply_client_pane_input_events(
                     runtime,
@@ -1878,13 +1941,7 @@ impl HeadlessServer {
                 return false;
             }
             if existing_owner != client_id {
-                self.send_to_client(
-                    existing_owner,
-                    ServerMessage::ServerShutdown {
-                        reason: Some("terminal attach taken over".to_owned()),
-                    },
-                );
-                self.remove_client_and_resize_if_needed(existing_owner);
+                self.take_over_direct_terminal(&terminal_id);
             }
         }
 
@@ -2355,9 +2412,17 @@ impl HeadlessServer {
                 let Some(client) = self.clients.get(&client_id) else {
                     return false;
                 };
-                if !client.is_active_shell_client() || client.outer_terminal_focus == Some(focused)
-                {
+                if !client.is_active_shell_client() {
                     return false;
+                }
+                let duplicate_focus = client.outer_terminal_focus == Some(focused);
+                let reclaimed = focused && self.reclaim_direct_control_for_shell_focus(client_id);
+                if duplicate_focus {
+                    if reclaimed {
+                        self.promote_client_to_foreground(client_id);
+                        self.claim_shell_tab_geometry(client_id, false);
+                    }
+                    return reclaimed;
                 }
                 let tab_id = self.shell_tab_id_for_client(client_id);
                 let another_focused_viewer = self.clients.iter().any(|(&other_id, client)| {
@@ -2498,6 +2563,12 @@ impl HeadlessServer {
                     client
                         .track_shell_input(ClientShellInputTarget::Pane(pane_id.clone()), &events);
                 }
+                let reclaimed = interaction
+                    && self.reclaim_direct_control_for_shell_pane(
+                        client_id,
+                        workspace_index,
+                        runtime_pane_id,
+                    );
                 let foreground_changed =
                     interaction && self.promote_client_to_foreground(client_id);
                 let geometry_changed =
@@ -2507,13 +2578,14 @@ impl HeadlessServer {
                     workspace_index,
                     runtime_pane_id,
                 ) else {
-                    return foreground_changed | geometry_changed;
+                    return reclaimed | foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
                 if let Err(err) = apply_client_pane_input_events(runtime, &events) {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
                 }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                reclaimed | foreground_changed | geometry_changed
+                    || runtime.scroll_metrics() != scroll_before
             }
             ServerEvent::ClientShellPopupInput {
                 client_id,

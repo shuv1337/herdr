@@ -2948,6 +2948,7 @@ mod tests {
             protocol: Some(2),
             capabilities: Some(crate::api::schema::ServerCapabilities {
                 live_handoff: true,
+                direct_control_yields_to_shell: false,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: Some(
                     crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
@@ -3023,6 +3024,7 @@ mod tests {
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     live_handoff: true,
+                    direct_control_yields_to_shell: false,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(
                         crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
@@ -3282,6 +3284,7 @@ mod tests {
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     live_handoff: true,
+                    direct_control_yields_to_shell: false,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(
                         crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,

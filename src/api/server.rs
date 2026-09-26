@@ -70,6 +70,7 @@ pub(crate) fn start_server_with_stop_control(
 fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
+        direct_control_yields_to_shell: true,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
         surface_interest: true,
@@ -1300,6 +1301,28 @@ mod tests {
     }
 
     #[test]
+    fn server_advertises_direct_control_yields_to_shell() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "capabilities".into(),
+                method: Method::Ping(Default::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["capabilities"]["direct_control_yields_to_shell"],
+            true
+        );
+        let legacy: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!legacy.direct_control_yields_to_shell);
+    }
+
+    #[test]
     fn ping_request_returns_pong() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let response = handle_request(
@@ -1310,6 +1333,7 @@ mod tests {
             &tx,
             Some(ServerCapabilities {
                 live_handoff: true,
+                direct_control_yields_to_shell: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: Some(
                     crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
