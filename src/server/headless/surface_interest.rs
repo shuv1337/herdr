@@ -22,6 +22,7 @@ impl HeadlessServer {
             if active {
                 client.shell_projection_revision =
                     client.shell_projection_revision.saturating_add(1);
+                client.focus_baseline_pending = true;
                 // Force the next control snapshot to carry this new floor instead of reusing a
                 // same-boot cached snapshot from the prior surface epoch.
                 client.shell_snapshot = None;

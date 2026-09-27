@@ -155,6 +155,8 @@ pub(crate) struct ClientConnection {
     pub(crate) host_terminal_appearance_explicit: bool,
     /// Last reported focus state for this client's outer terminal.
     pub(crate) outer_terminal_focus: Option<bool>,
+    /// The next focus report establishes the baseline after connect or surface activation.
+    pub(crate) focus_baseline_pending: bool,
     /// Last focused-pane report-all demand sent to a client-owned shell.
     pub(crate) host_keyboard_report_all_active: Option<bool>,
     /// Whether an ordinary render was skipped because the render channel was full.
@@ -236,6 +238,7 @@ impl ClientConnection {
             host_terminal_appearance: None,
             host_terminal_appearance_explicit: false,
             outer_terminal_focus: None,
+            focus_baseline_pending: true,
             host_keyboard_report_all_active: None,
             render_pending: false,
             shell_surface_active: true,

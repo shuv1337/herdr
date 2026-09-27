@@ -952,8 +952,7 @@ impl HeadlessServer {
             self.reconcile_client_shell_locations();
         }
         let focus_after = self.shell_focus_target(client_id);
-        let reclaimed = (focus_succeeded || focus_before != focus_after)
-            && self.reclaim_direct_control_for_shell_focus(client_id);
+        let reclaimed = focus_succeeded && self.reclaim_direct_control_for_shell_focus(client_id);
         if let Some(all_focus_before) = all_focus_before {
             self.finish_shell_location_reconciliation(all_focus_before, &focused_tabs_before);
         } else {

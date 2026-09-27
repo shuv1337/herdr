@@ -303,7 +303,6 @@ fn client_status_json() -> ClientStatusJson {
             crate::protocol::endpoint::SURFACE_INTEREST_CAPABILITY,
             crate::protocol::endpoint::PRESENTATION_EFFECTS_FENCE_CAPABILITY,
             crate::protocol::endpoint::HEALTH_CHECK_CAPABILITY,
-            crate::protocol::endpoint::DIRECT_CONTROL_YIELDS_TO_SHELL_CAPABILITY,
         ],
         remote_host_bridge: true,
         remote_bridge_idle_timeout: crate::platform::REMOTE_BRIDGE_IDLE_TIMEOUT_SUPPORTED,
@@ -445,6 +444,12 @@ mod tests {
             value["capabilities"]["direct_control_yields_to_shell"],
             true
         );
+        let client = serde_json::to_value(client_status_json()).unwrap();
+        assert!(!client["endpoint_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "direct_control_yields_to_shell"));
     }
 
     #[test]

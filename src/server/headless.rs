@@ -1110,7 +1110,11 @@ impl HeadlessServer {
     }
 
     /// Reuse direct takeover teardown so observers and shell clients stay connected.
-    fn take_over_direct_terminal(&mut self, terminal_id: &str) -> bool {
+    fn take_over_direct_terminal(
+        &mut self,
+        terminal_id: &str,
+        restore_shell_geometry: bool,
+    ) -> bool {
         let Some(owner) = self.terminal_attach_owners.get(terminal_id).copied() else {
             return false;
         };
@@ -1120,7 +1124,33 @@ impl HeadlessServer {
                 reason: Some("terminal attach taken over".to_owned()),
             },
         );
-        self.remove_client_and_resize_if_needed(owner);
+        if restore_shell_geometry {
+            self.remove_client_and_resize_if_needed(owner);
+        } else {
+            // The reclaiming shell applies its own geometry immediately afterward.
+            self.remove_client(owner);
+        }
+        true
+    }
+
+    fn reclaim_direct_control_for_shell_terminal(
+        &mut self,
+        client_id: u64,
+        terminal_id: &str,
+    ) -> bool {
+        if self.handoff_in_progress
+            || self.terminal_attach_owners.is_empty()
+            || !self
+                .clients
+                .get(&client_id)
+                .is_some_and(ClientConnection::is_active_shell_client)
+            || !self.take_over_direct_terminal(terminal_id, false)
+        {
+            return false;
+        }
+        // Claim even with multiple shells; the old single-shell fallback cannot do that.
+        let _ = self.claim_shell_tab_geometry(client_id, false)
+            || self.resize_shell_tab_if_controller(client_id, false);
         true
     }
 
@@ -1150,7 +1180,7 @@ impl HeadlessServer {
         else {
             return false;
         };
-        self.take_over_direct_terminal(&terminal_id)
+        self.reclaim_direct_control_for_shell_terminal(client_id, &terminal_id)
     }
 
     fn reclaim_direct_control_for_shell_focus(&mut self, client_id: u64) -> bool {
@@ -1391,10 +1421,12 @@ impl HeadlessServer {
                 {
                     return false;
                 }
+                let reclaimed =
+                    self.reclaim_direct_control_for_shell_terminal(client_id, &terminal_id);
                 let foreground_changed = self.promote_client_to_foreground(client_id);
                 let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
-                    return foreground_changed | geometry_changed;
+                    return reclaimed | foreground_changed | geometry_changed;
                 };
                 if let Err(err) = apply_client_popup_input_events(
                     runtime,
@@ -1941,7 +1973,7 @@ impl HeadlessServer {
                 return false;
             }
             if existing_owner != client_id {
-                self.take_over_direct_terminal(&terminal_id);
+                self.take_over_direct_terminal(&terminal_id, true);
             }
         }
 
@@ -2415,14 +2447,16 @@ impl HeadlessServer {
                 if !client.is_active_shell_client() {
                     return false;
                 }
-                let duplicate_focus = client.outer_terminal_focus == Some(focused);
-                let reclaimed = focused && self.reclaim_direct_control_for_shell_focus(client_id);
-                if duplicate_focus {
-                    if reclaimed {
-                        self.promote_client_to_foreground(client_id);
-                        self.claim_shell_tab_geometry(client_id, false);
-                    }
-                    return reclaimed;
+                let previous_focus = client.outer_terminal_focus;
+                let baseline_pending = client.focus_baseline_pending;
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    client.focus_baseline_pending = false;
+                }
+                if previous_focus == Some(focused) {
+                    return false;
+                }
+                if !baseline_pending && previous_focus == Some(false) && focused {
+                    self.reclaim_direct_control_for_shell_focus(client_id);
                 }
                 let tab_id = self.shell_tab_id_for_client(client_id);
                 let another_focused_viewer = self.clients.iter().any(|(&other_id, client)| {
@@ -2563,7 +2597,7 @@ impl HeadlessServer {
                     client
                         .track_shell_input(ClientShellInputTarget::Pane(pane_id.clone()), &events);
                 }
-                let reclaimed = interaction
+                let reclaimed = client_pane_input_reclaims_direct_control(&events)
                     && self.reclaim_direct_control_for_shell_pane(
                         client_id,
                         workspace_index,
@@ -2652,18 +2686,21 @@ impl HeadlessServer {
                         &events,
                     );
                 }
+                let reclaimed = client_pane_input_reclaims_direct_control(&events)
+                    && self.reclaim_direct_control_for_shell_terminal(client_id, &terminal_id);
                 let foreground_changed =
                     interaction && self.promote_client_to_foreground(client_id);
                 let geometry_changed =
                     interaction && self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
-                    return foreground_changed | geometry_changed;
+                    return reclaimed | foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
                 if let Err(err) = apply_client_popup_input_events(runtime, &events) {
                     warn!(client_id, terminal_id, err = %err, "targeted client popup input failed");
                 }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                reclaimed | foreground_changed | geometry_changed
+                    || runtime.scroll_metrics() != scroll_before
             }
             ServerEvent::ClientShellEndpointRequestError {
                 client_id,
@@ -3540,6 +3577,23 @@ fn client_pane_input_has_interaction(events: &[protocol::ClientPaneInputEvent]) 
     events
         .iter()
         .any(|event| !client_pane_input_releases_press(event))
+}
+
+fn client_pane_input_reclaims_direct_control(events: &[protocol::ClientPaneInputEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            protocol::ClientPaneInputEvent::Key {
+                kind: protocol::ClientKeyKind::Press | protocol::ClientKeyKind::Repeat,
+                ..
+            } | protocol::ClientPaneInputEvent::TextCommit(_)
+                | protocol::ClientPaneInputEvent::Paste(_)
+                | protocol::ClientPaneInputEvent::Mouse {
+                    kind: protocol::ClientMouseKind::Down(_),
+                    ..
+                }
+        )
+    })
 }
 
 impl Drop for HeadlessServer {

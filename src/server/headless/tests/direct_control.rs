@@ -81,7 +81,6 @@ fn with_controlled_pane(
 fn shell_activity_takes_over_direct_control_and_restores_geometry() {
     for trigger in [
         "focus",
-        "repeat-focus",
         "pane-selection",
         "tab-selection",
         "workspace-selection",
@@ -90,10 +89,11 @@ fn shell_activity_takes_over_direct_control_and_restores_geometry() {
         with_controlled_pane(
             |server, terminal_id, pane_id, size, controller, observer, mut input| {
                 match trigger {
-                    "focus" | "repeat-focus" => {
-                        if trigger == "repeat-focus" {
-                            server.clients.get_mut(&1).unwrap().outer_terminal_focus = Some(true);
-                        }
+                    "focus" => {
+                        server.handle_server_event(ServerEvent::ClientShellFocus {
+                            client_id: 1,
+                            focused: false,
+                        });
                         assert!(server.handle_server_event(ServerEvent::ClientShellFocus {
                             client_id: 1,
                             focused: true,
@@ -219,6 +219,284 @@ fn shell_activity_takes_over_direct_control_and_restores_geometry() {
             },
         );
     }
+}
+
+fn shell_request(server: &mut HeadlessServer, method: api::schema::Method) -> String {
+    let (respond_to, response) = std::sync::mpsc::channel();
+    server.handle_client_shell_api_request(
+        1,
+        api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "reclaim-test".into(),
+                method,
+            },
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        },
+    );
+    response.try_recv().unwrap()
+}
+
+fn assert_direct_owner_remains(
+    server: &HeadlessServer,
+    terminal_id: &crate::terminal::TerminalId,
+    controller: &std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    assert_eq!(
+        server.terminal_attach_owners.get(terminal_id.as_str()),
+        Some(&2)
+    );
+    assert!(server
+        .app
+        .state
+        .direct_attach_resize_locks
+        .contains(terminal_id));
+    assert!(controller.try_recv().is_err());
+}
+
+#[test]
+fn focus_baselines_and_repeated_true_do_not_reclaim() {
+    with_controlled_pane(|server, terminal_id, _, size, controller, _, _| {
+        assert!(server.handle_server_event(ServerEvent::ClientShellFocus {
+            client_id: 1,
+            focused: true,
+        }));
+        server.handle_server_event(ServerEvent::ClientShellFocus {
+            client_id: 1,
+            focused: true,
+        });
+        assert_direct_owner_remains(server, &terminal_id, &controller);
+
+        server.handle_server_event(ServerEvent::ClientShellFocus {
+            client_id: 1,
+            focused: false,
+        });
+        assert!(server.set_client_shell_surface_active(1, false).is_some());
+        assert!(server.set_client_shell_surface_active(1, true).is_some());
+        server.handle_server_event(ServerEvent::ClientShellFocus {
+            client_id: 1,
+            focused: true,
+        });
+        assert_direct_owner_remains(server, &terminal_id, &controller);
+        assert_eq!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .current_size(),
+            (30, 100)
+        );
+        assert_ne!(size, (30, 100));
+
+        server.handle_server_event(ServerEvent::ClientShellFocus {
+            client_id: 1,
+            focused: false,
+        });
+        server.handle_server_event(ServerEvent::ClientShellFocus {
+            client_id: 1,
+            focused: true,
+        });
+        assert_eq!(
+            read_server_shutdown_reason(controller.try_recv().unwrap()),
+            Some("terminal attach taken over".into())
+        );
+    });
+}
+
+fn pane_key(kind: protocol::ClientKeyKind) -> protocol::ClientPaneInputEvent {
+    protocol::ClientPaneInputEvent::Key {
+        code: protocol::ClientKeyCode::Char('x'),
+        modifiers: 0,
+        kind,
+        repeat_count: 1,
+        shifted_codepoint: None,
+        generated_text: None,
+        tracks_release: false,
+        physical_key_id: None,
+        windows_record: None,
+    }
+}
+
+#[test]
+fn hover_scroll_and_release_preserve_control_but_key_press_reclaims() {
+    with_controlled_pane(|server, terminal_id, pane_id, _, controller, _, _| {
+        for kind in [
+            protocol::ClientMouseKind::Moved,
+            protocol::ClientMouseKind::ScrollUp,
+            protocol::ClientMouseKind::Drag(protocol::ClientMouseButton::Left),
+            protocol::ClientMouseKind::Up(protocol::ClientMouseButton::Left),
+        ] {
+            server.handle_server_event(ServerEvent::ClientShellPaneInput {
+                client_id: 1,
+                pane_id: pane_id.clone(),
+                events: vec![protocol::ClientPaneInputEvent::Mouse {
+                    kind,
+                    position: protocol::ClientMousePosition::Cell { column: 0, row: 0 },
+                    geometry: None,
+                    modifiers: 0,
+                    lines: 1,
+                }],
+            });
+            assert_direct_owner_remains(server, &terminal_id, &controller);
+        }
+        server.handle_server_event(ServerEvent::ClientShellPaneInput {
+            client_id: 1,
+            pane_id: pane_id.clone(),
+            events: vec![pane_key(protocol::ClientKeyKind::Release)],
+        });
+        assert_direct_owner_remains(server, &terminal_id, &controller);
+        server.handle_server_event(ServerEvent::ClientShellPaneInput {
+            client_id: 1,
+            pane_id,
+            events: vec![pane_key(protocol::ClientKeyKind::Press)],
+        });
+        assert_eq!(
+            read_server_shutdown_reason(controller.try_recv().unwrap()),
+            Some("terminal attach taken over".into())
+        );
+    });
+}
+
+#[test]
+fn close_and_swap_api_requests_do_not_reclaim() {
+    with_controlled_pane(|server, terminal_id, pane_id, _, controller, _, _| {
+        let second_tab = server.app.state.workspaces[0].test_add_tab(Some("temporary"));
+        let second_tab_id = server.app.public_tab_id(0, second_tab).unwrap();
+        assert!(server.focus_shell_client_on_tab(1, &second_tab_id));
+        let focus_before_close = server.shell_focus_target(1);
+        let response = shell_request(
+            server,
+            api::schema::Method::TabClose(api::schema::TabTarget {
+                tab_id: second_tab_id,
+            }),
+        );
+        assert!(serde_json::from_str::<api::schema::SuccessResponse>(&response).is_ok());
+        assert_ne!(server.shell_focus_target(1), focus_before_close);
+        assert_direct_owner_remains(server, &terminal_id, &controller);
+
+        let second_pane =
+            server.app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let second_pane_id = server.app.public_pane_id(0, second_pane).unwrap();
+        let focus_before_swap = server.shell_focus_target(1);
+        let response = shell_request(
+            server,
+            api::schema::Method::PaneSwap(api::schema::PaneSwapParams {
+                source_pane_id: Some(pane_id),
+                target_pane_id: Some(second_pane_id),
+                ..Default::default()
+            }),
+        );
+        assert!(serde_json::from_str::<api::schema::SuccessResponse>(&response).is_ok());
+        assert_ne!(server.shell_focus_target(1), focus_before_swap);
+        assert_direct_owner_remains(server, &terminal_id, &controller);
+    });
+}
+
+#[test]
+fn popup_input_and_image_paste_reclaim_direct_control() {
+    for image_paste in [false, true] {
+        with_controlled_pane(|server, _, _, _, _, observer, _| {
+            let (runtime, mut input) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    40, 12, 0, b"", 4,
+                );
+            let (_, popup_terminal_id) = server.app.install_test_popup_runtime(runtime);
+            server.popup_owner_tab_id = server.app.public_tab_id(0, 0);
+            let controller = connect_pending_terminal_client_with_control_rx(server, 4);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientControlTerminal {
+                    client_id: 4,
+                    target: popup_terminal_id.to_string(),
+                    takeover: true,
+                })
+            );
+            if image_paste {
+                server.paste_client_clipboard_image_path(
+                    1,
+                    protocol::ClientClipboardImageTarget::Popup(popup_terminal_id.to_string()),
+                    "/tmp/popup-image.png".into(),
+                );
+            } else {
+                server.handle_server_event(ServerEvent::ClientShellPopupInput {
+                    client_id: 1,
+                    terminal_id: popup_terminal_id.to_string(),
+                    events: vec![protocol::ClientPaneInputEvent::TextCommit("p".into())],
+                });
+            }
+            assert_eq!(
+                read_server_shutdown_reason(controller.try_recv().unwrap()),
+                Some("terminal attach taken over".into())
+            );
+            assert!(!server
+                .app
+                .state
+                .direct_attach_resize_locks
+                .contains(&popup_terminal_id));
+            assert!(input.try_recv().is_ok());
+            assert!(observer.try_recv().is_err());
+        });
+    }
+}
+
+#[test]
+fn reclaim_claims_geometry_with_multiple_shell_clients() {
+    with_controlled_pane(
+        |server, terminal_id, pane_id, shell_size, controller, _, _| {
+            server.clients.insert(
+                4,
+                ClientConnection::new(
+                    (90, 30),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    4,
+                    RenderEncoding::SemanticFrame,
+                    None,
+                ),
+            );
+            let (first_writer, _, _) = test_client_writer();
+            server.clients.get_mut(&1).unwrap().writer = Some(first_writer);
+            let (second_writer, _, _) = test_client_writer();
+            server.clients.get_mut(&4).unwrap().writer = Some(second_writer);
+            server.reconcile_client_shell_locations();
+            assert_eq!(server.app_client_count(), 2);
+            assert!(server.claim_shell_tab_geometry(4, false));
+            server.handle_server_event(ServerEvent::ClientShellPaneInput {
+                client_id: 1,
+                pane_id,
+                events: vec![protocol::ClientPaneInputEvent::TextCommit("x".into())],
+            });
+            assert_eq!(
+                read_server_shutdown_reason(controller.try_recv().unwrap()),
+                Some("terminal attach taken over".into())
+            );
+            assert_eq!(
+                server
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .unwrap()
+                    .current_size(),
+                shell_size
+            );
+            let tab_id = server.shell_tab_id_for_client(1).unwrap();
+            assert_eq!(server.tab_geometry_controllers.get(&tab_id), Some(&1));
+        },
+    );
+}
+
+#[test]
+fn live_handoff_blocks_reclaim() {
+    with_controlled_pane(|server, terminal_id, pane_id, _, controller, _, _| {
+        server.handoff_in_progress = true;
+        server.handle_server_event(ServerEvent::ClientShellPaneInput {
+            client_id: 1,
+            pane_id,
+            events: vec![protocol::ClientPaneInputEvent::TextCommit("x".into())],
+        });
+        assert_direct_owner_remains(server, &terminal_id, &controller);
+        server.handoff_in_progress = false;
+    });
 }
 
 #[test]
