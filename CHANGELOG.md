@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## [0.9.1-shuv.5] - 2026-09-27
+
+### Fixed
+- Direct terminal control now yields only to deliberate shell focus transitions, explicit focus commands, and press/text/paste input, including popup terminals. Shell geometry is restored on reclaim without an intermediate resize.
+- `direct_control_yields_to_shell` is reported as a server capability rather than a local client capability.
+- Fork build identity: Cargo base `0.9.1`, built with `HERDR_FORK_REVISION=5`. No tag or release is published by this change.
+
 ## [0.9.1-shuv.4] - 2026-09-26
 
 ### Fixed
