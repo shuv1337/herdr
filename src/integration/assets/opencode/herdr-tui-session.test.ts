@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { mkdir, readFile, rm } from "node:fs/promises";
 
 const requests: unknown[] = [];
 const activeDisposers: Array<() => void> = [];
@@ -8,6 +9,10 @@ let importCounter = 0;
 let holdConnections = false;
 let failConnections = false;
 const connections: Array<() => void> = [];
+const realNow = Date.now;
+const originalArgv = [...process.argv];
+let clockOffset = 0;
+let clock: ReturnType<typeof spyOn>;
 
 mock.module("node:net", () => ({
   default: {
@@ -45,6 +50,9 @@ mock.module("node:net", () => ({
 }));
 
 beforeEach(() => {
+  clockOffset = 0;
+  clock = spyOn(Date, "now").mockImplementation(() => realNow() + clockOffset);
+  process.argv = [...originalArgv];
   requests.length = 0;
   requestWaiters.length = 0;
   stateWaiters.length = 0;
@@ -55,12 +63,16 @@ beforeEach(() => {
   process.env.HERDR_SOCKET_PATH = "test.sock";
   process.env.HERDR_PANE_ID = "test:p1";
   delete process.env.OPENCODE_CONFIG_DIR;
+  delete process.env.HERDR_OPENCODE_TRACE;
 });
 
 afterEach(() => {
   for (const dispose of activeDisposers.splice(0)) {
     dispose();
   }
+  clock.mockRestore();
+  process.argv = [...originalArgv];
+  delete process.env.HERDR_OPENCODE_TRACE;
 });
 
 async function loadPlugin() {
@@ -228,6 +240,10 @@ function v2Api() {
   const listeners = new Set<(event: unknown) => void>();
   const permissions = new Map<string, Array<{ id: string }> | undefined>();
   const forms = new Map<string, Array<{ id: string }> | undefined>();
+  const statuses = new Map<string, string>();
+  const serverPermissions = new Map<string, Array<{ id: string }>>();
+  const invalidated: string[] = [];
+  const synced: string[] = [];
   return {
     api: {
       ui: { router: { current: () => route } },
@@ -235,8 +251,15 @@ function v2Api() {
         session: {
           get: (id: string) => sessions.get(id),
           family: () => [...sessions.keys()],
-          status: () => "idle",
-          permission: { list: (id: string) => permissions.get(id) },
+           status: (id: string) => statuses.get(id) ?? "idle",
+           permission: {
+             list: (id: string) => permissions.get(id),
+             invalidate: (id: string) => { invalidated.push(id); },
+             sync: async (id: string) => {
+               synced.push(id);
+               permissions.set(id, serverPermissions.get(id) ?? []);
+             },
+           },
           form: { list: (id: string) => forms.get(id) },
         },
         listen: (handler: (event: unknown) => void) => {
@@ -254,12 +277,24 @@ function v2Api() {
     sessions,
     permissions,
     forms,
+    statuses,
+    serverPermissions,
+    invalidated,
+    synced,
   };
 }
 
 const flushReports = () => new Promise((resolve) => setTimeout(resolve, 10));
+// Advance debounce deadlines without sleeping through each 1.5-second delay.
+// Real polling still runs, so timer disposal and reconciliation are exercised.
+const advance = async (ms: number) => {
+  clockOffset += ms;
+  await new Promise((resolve) => setTimeout(resolve, 120));
+};
 const states = () => requests.filter((r) => requestParam(r, "state") !== undefined)
   .map((r) => requestParam(r, "state"));
+const metadata = () => requests.filter((r) => isRecord(r) && r.method === "pane.report_metadata");
+const sessionReports = () => requests.filter((r) => isRecord(r) && r.method !== "pane.report_metadata");
 
 test("V2 ignores events without data", async () => {
   const plugin = await loadPlugin();
@@ -285,7 +320,12 @@ test("V2 completes and interrupts without legacy idle events", async () => {
     tui.emit("session.execution.started", { sessionID: "a" });
     tui.emit(`session.execution.${terminal}`, { sessionID: "a" });
     await flushReports();
-    expect(states()).toEqual(["working", terminal === "failed" ? "blocked" : "idle"]);
+    expect(states()).toEqual(["working"]);
+    await advance(1_600);
+    expect(states().at(-1)).toBe("idle");
+    expect(requestParam(metadata().at(-1), "state_labels")).toEqual(
+      terminal === "failed" ? { idle: "failed", done: "failed" } : undefined,
+    );
     dispose();
   }
 });
@@ -306,11 +346,13 @@ test("V2 aggregates root and child blockers and ignores other roots and child co
   tui.emit("permission.asked", { sessionID: "b", id: "other" });
   await flushReports();
   expect(states().at(-1)).toBe("blocked");
-  expect(requests.every((r) => requestParam(r, "agent_session_id") === "a")).toBe(true);
+  expect(sessionReports().every((r) => requestParam(r, "agent_session_id") === "a")).toBe(true);
   tui.emit("form.cancelled", { sessionID: "child", id: "form-child" });
   tui.emit("session.execution.succeeded", { sessionID: "a" });
   await flushReports();
-  expect(states().slice(-2)).toEqual(["working", "idle"]);
+  expect(states().at(-1)).toBe("working");
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
 });
 
 test("V2 discards queued reports after selection changes and stops on disposal", async () => {
@@ -324,7 +366,7 @@ test("V2 discards queued reports after selection changes and stops on disposal",
   tui.select("b");
   tui.emit("session.execution.started", { sessionID: "b" });
   await flushReports();
-  expect(requests.every((r) => requestParam(r, "agent_session_id") === "b")).toBe(true);
+  expect(sessionReports().every((r) => requestParam(r, "agent_session_id") === "b")).toBe(true);
   requests.length = 0;
   tui.emit("session.execution.succeeded", { sessionID: "b" });
   tui.home();
@@ -406,10 +448,303 @@ test("V2 resends the latest state after a failed delivery", async () => {
   await flushReports();
   failConnections = true;
   tui.emit("session.execution.succeeded", { sessionID: "a" });
-  const resend = waitForStateReport();
-  await new Promise((resolve) => setTimeout(resolve, 700));
+  await advance(1_600);
+  await new Promise((resolve) => setTimeout(resolve, 600));
   failConnections = false;
+  const resend = waitForStateReport();
   await resend;
   expect(states().at(-1)).toBe("idle");
   dispose();
+});
+
+async function startV2(tui = v2Api()) {
+  const plugin = await loadPlugin();
+  const dispose = plugin.setup(tui.api);
+  activeDisposers.push(dispose);
+  await flushReports();
+  return { tui, dispose };
+}
+
+test("regression: interrupted permission without permission.replied returns to idle", async () => {
+  const { tui } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.permissions.set("a", [{ id: "ghost" }]);
+  tui.emit("permission.asked", { sessionID: "a", id: "ghost" });
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
+  tui.emit("session.execution.interrupted", { sessionID: "a", reason: "user" });
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+  expect(tui.invalidated).toContain("a");
+  expect(tui.synced).toContain("a");
+  expect(tui.permissions.get("a")).toEqual([]);
+});
+
+test("regression: child permission orphaned by parent interrupt returns to idle", async () => {
+  const { tui } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("session.execution.started", { sessionID: "child" });
+  tui.permissions.set("child", [{ id: "ghost" }]);
+  tui.emit("permission.asked", { sessionID: "child", id: "ghost" });
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
+  tui.emit("session.execution.interrupted", { sessionID: "child", reason: "user" });
+  tui.emit("session.execution.interrupted", { sessionID: "a", reason: "user" });
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+  expect(tui.invalidated).toEqual(["child", "a"]);
+  expect(tui.permissions.get("child")).toEqual([]);
+});
+
+test("regression: failed root reads done with failed label until next root start", async () => {
+  const { tui } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("session.execution.failed", { sessionID: "a", error: { type: "provider.rate-limit" } });
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+  expect(requestParam(metadata().at(-1), "state_labels")).toEqual({ idle: "failed", done: "failed" });
+  expect(requestParam(metadata().at(-1), "source")).toBe("herdr:opencode:turn");
+  expect(requestParam(metadata().at(-1), "applies_to_source")).toBe("herdr:opencode");
+  // A descendant's start/completion must not erase the root's failure label.
+  tui.emit("session.execution.started", { sessionID: "child" });
+  tui.emit("session.execution.succeeded", { sessionID: "child" });
+  await advance(1_600);
+  expect(requestParam(metadata().at(-1), "state_labels")).toEqual({ idle: "failed", done: "failed" });
+  tui.emit("session.execution.started", { sessionID: "a" });
+  await flushReports();
+  expect(states().at(-1)).toBe("working");
+  expect(requestParam(metadata().at(-1), "clear_state_labels")).toBe(true);
+});
+
+test("regression: root stays working while a background child runs then goes idle", async () => {
+  const { tui } = await startV2();
+  tui.statuses.set("a", "running");
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.statuses.set("child", "running");
+  tui.emit("session.execution.started", { sessionID: "child" });
+  tui.statuses.set("a", "idle");
+  tui.emit("session.execution.succeeded", { sessionID: "a" });
+  await advance(2_000);
+  expect(states().at(-1)).toBe("working");
+  tui.statuses.set("child", "idle");
+  tui.emit("session.execution.succeeded", { sessionID: "child" });
+  await flushReports();
+  expect(states().at(-1)).toBe("working");
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+});
+
+test("regression: idle debounce absorbs child completion to parent wake gap", async () => {
+  const { tui } = await startV2();
+  tui.statuses.set("child", "running");
+  tui.emit("session.execution.started", { sessionID: "child" });
+  await flushReports();
+  requests.length = 0;
+  tui.statuses.set("child", "idle");
+  tui.emit("session.execution.succeeded", { sessionID: "child" });
+  await advance(300);
+  expect(states()).not.toContain("idle");
+  tui.emit("session.execution.started", { sessionID: "a" });
+  await advance(2_000);
+  expect(states()).not.toContain("idle");
+  tui.emit("session.execution.succeeded", { sessionID: "a" });
+  await advance(1_000);
+  expect(states()).not.toContain("idle");
+  await advance(600);
+  expect(states().filter((s) => s === "idle")).toHaveLength(1);
+});
+
+test("regression: child-route --auto stall reports blocked immediately", async () => {
+  process.argv.push("--auto");
+  const tui = v2Api();
+  tui.select("child");
+  await startV2(tui);
+  tui.statuses.set("child", "running");
+  tui.emit("session.execution.started", { sessionID: "child" });
+  tui.permissions.set("child", [{ id: "real-ask" }]);
+  tui.emit("permission.asked", { sessionID: "child", id: "real-ask" });
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
+  expect(sessionReports().every((r) => requestParam(r, "agent_session_id") === "a")).toBe(true);
+  await advance(2_000);
+  expect(states().at(-1)).toBe("blocked");
+});
+
+test("V2 autoaccept hides short permission blips but reports persistent asks and forms", async () => {
+  process.argv.push("--auto");
+  const { tui } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("permission.asked", { sessionID: "child", id: "auto" });
+  await advance(200);
+  expect(states()).not.toContain("blocked");
+  tui.emit("permission.replied", { sessionID: "child", requestID: "auto" });
+  await advance(600);
+  expect(states()).not.toContain("blocked");
+  tui.emit("permission.asked", { sessionID: "a", id: "persistent" });
+  await advance(600);
+  expect(states().at(-1)).toBe("blocked");
+  tui.emit("permission.replied", { sessionID: "a", requestID: "persistent" });
+  tui.emit("form.created", { form: { sessionID: "a", id: "question" } });
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
+});
+
+test("V2 an autoaccept permission becomes immediately blocked on a child route", async () => {
+  process.argv.push("--auto");
+  const { tui } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("permission.asked", { sessionID: "child", id: "auto" });
+  await flushReports();
+  expect(states().at(-1)).toBe("working");
+  tui.select("child");
+  await advance(100);
+  expect(states().at(-1)).toBe("blocked");
+});
+
+test("V2 expired asks cannot revive from stale or unhydrated cache without sync helpers", async () => {
+  const tui = v2Api();
+  // Older API shapes and existing test fakes lack these optional methods.
+  delete (tui.api.data.session.permission as Partial<typeof tui.api.data.session.permission>).sync;
+  delete (tui.api.data.session.permission as Partial<typeof tui.api.data.session.permission>).invalidate;
+  await startV2(tui);
+  tui.emit("permission.asked", { sessionID: "child", id: "ghost" });
+  tui.emit("session.execution.interrupted", { sessionID: "child" });
+  await advance(200);
+  expect(states().at(-1)).toBe("idle");
+  tui.permissions.set("child", [{ id: "ghost" }]);
+  await advance(2_000);
+  expect(states().at(-1)).toBe("idle");
+  tui.permissions.set("child", []);
+  await advance(100);
+  tui.permissions.set("child", [{ id: "new" }]);
+  await advance(100);
+  expect(states().at(-1)).toBe("blocked");
+});
+
+test("V2 reconciles descendant activity from the cache even without lifecycle events", async () => {
+  const { tui } = await startV2();
+  tui.statuses.set("child", "running");
+  await advance(100);
+  expect(states().at(-1)).toBe("working");
+  tui.statuses.set("child", "idle");
+  await advance(100);
+  expect(states().at(-1)).toBe("working");
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+});
+
+test("V2 failed parent remains working while descendants run without losing its label", async () => {
+  const { tui } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.statuses.set("child", "running");
+  tui.emit("session.execution.failed", { sessionID: "a" });
+  await advance(2_000);
+  expect(states().at(-1)).toBe("working");
+  expect(requestParam(metadata().at(-1), "state_labels")).toEqual({ idle: "failed", done: "failed" });
+  tui.statuses.set("child", "idle");
+  tui.emit("session.execution.failed", { sessionID: "child" });
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+  expect(requestParam(metadata().at(-1), "state_labels")).toEqual({ idle: "failed", done: "failed" });
+});
+
+test("V2 child lifecycle deltas bridge late cache updates without pinning finished work", async () => {
+  const { tui } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "child" });
+  await advance(2_000);
+  expect(states().at(-1)).toBe("working");
+  tui.statuses.set("child", "running");
+  await advance(100);
+  tui.emit("session.execution.succeeded", { sessionID: "child" });
+  // The cache still says running after the terminal event.
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+  tui.statuses.set("child", "idle");
+  await advance(100);
+  // A later run visible only through cache must not be suppressed by old deltas.
+  tui.statuses.set("child", "running");
+  await advance(100);
+  expect(states().at(-1)).toBe("working");
+});
+
+test("V2 sync rejection cannot revive expired asks or interfere with another selection", async () => {
+  const tui = v2Api();
+  tui.api.data.session.permission.sync = async () => { throw new Error("offline"); };
+  await startV2(tui);
+  tui.permissions.set("a", [{ id: "ghost" }]);
+  tui.emit("permission.asked", { sessionID: "a", id: "ghost" });
+  tui.emit("session.execution.failed", { sessionID: "a" });
+  await advance(2_000);
+  expect(states().at(-1)).toBe("idle");
+  tui.select("b");
+  tui.emit("permission.asked", { sessionID: "b", id: "new" });
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
+  expect(requestParam(metadata().at(-1), "clear_state_labels")).toBe(true);
+});
+
+test("V2 syncs missing ancestors on a child route without repeated concurrent fetches", async () => {
+  const tui = v2Api();
+  tui.sessions.delete("a");
+  tui.select("child");
+  let resolveSync: () => void = () => {};
+  const sync = mock(() => new Promise<void>((resolve) => { resolveSync = resolve; }));
+  Object.assign(tui.api.data.session, { sync });
+  await startV2(tui);
+  await advance(500);
+  expect(sync).toHaveBeenCalledTimes(1);
+  expect(sync).toHaveBeenCalledWith("a");
+  expect(requests).toHaveLength(0);
+  tui.sessions.set("a", { id: "a" });
+  tui.permissions.set("child", [{ id: "real" }]);
+  resolveSync();
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
+  expect(sessionReports().every((r) => requestParam(r, "agent_session_id") === "a")).toBe(true);
+});
+
+test("V2 debounce state and failed metadata do not leak across selections or disposal", async () => {
+  const { tui, dispose } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("session.execution.failed", { sessionID: "a" });
+  await flushReports();
+  requests.length = 0;
+  tui.select("b");
+  await advance(200);
+  expect(states().at(-1)).toBe("idle");
+  expect(requestParam(metadata().at(-1), "clear_state_labels")).toBe(true);
+  expect(sessionReports().every((r) => requestParam(r, "agent_session_id") === "b")).toBe(true);
+  dispose();
+  requests.length = 0;
+  await advance(2_000);
+  expect(requests).toHaveLength(0);
+});
+
+test("V2 opt-in publish trace contains reasons and owners but no prompt payload", async () => {
+  await mkdir(".local", { recursive: true });
+  const path = `.local/herdr-tui-trace-${process.pid}.jsonl`;
+  process.env.HERDR_OPENCODE_TRACE = path;
+  const { tui, dispose } = await startV2();
+  try {
+    tui.emit("permission.asked", { sessionID: "child", id: "trace", secretPrompt: "never-record-me" });
+    await flushReports();
+    const text = await readFile(path, "utf8");
+    const entries = text.trim().split("\n").map((line) => JSON.parse(line));
+    expect(entries.some((e) => e.reason === "permission.asked" && e.root === "a" &&
+      e.route.sessionID === "a" && e.rootState === "idle" && e.state === "blocked" &&
+      e.blockers.some((b: { key: string; owner: string }) => b.key === "permission:trace" && b.owner === "child"))).toBe(true);
+    expect(text).not.toContain("never-record-me");
+    dispose();
+  } finally {
+    dispose();
+    await rm(path, { force: true });
+  }
+});
+
+test("V2 an unwritable trace does not prevent status delivery", async () => {
+  process.env.HERDR_OPENCODE_TRACE = ".local/missing-trace-dir/trace.jsonl";
+  const { tui } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  await flushReports();
+  expect(states().at(-1)).toBe("working");
 });
