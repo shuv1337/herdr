@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 
 const requests: unknown[] = [];
 const activeDisposers: Array<() => void> = [];
@@ -538,6 +538,58 @@ test("regression: settle expires cache-only permission rows before blind sync re
   expect(states().at(-1)).toBe("idle");
 });
 
+test("regression: overlapping terminal refreshes keep tombstones until every sync settles", async () => {
+  for (const laterOutcome of ["success", "throw", "reject"]) {
+    const { tui, dispose } = await startV2();
+    tui.emit("session.execution.started", { sessionID: "a" });
+    tui.permissions.set("a", [{ id: "replied" }]);
+    tui.emit("permission.asked", { sessionID: "a", id: "replied" });
+    await flushReports();
+    tui.permissions.set("a", []);
+    tui.emit("permission.replied", { sessionID: "a", requestID: "replied" });
+    await flushReports();
+    requests.length = 0;
+    const finish: Array<() => void> = [];
+    let calls = 0;
+    tui.api.data.session.permission.sync = (id) => {
+      const call = calls++;
+      if (call === 1 && laterOutcome === "throw") throw new Error("synchronous sync failure");
+      if (call === 1 && laterOutcome === "reject") return Promise.reject(new Error("async sync failure"));
+      return new Promise<void>((resolve) => {
+        finish.push(() => {
+          // Each sync blindly replaces the cache when its own fetch completes.
+          tui.permissions.set(id, call === 0 ? [{ id: "replied" }] : []);
+          resolve();
+        });
+      });
+    };
+    tui.emit("session.execution.succeeded", { sessionID: "a" });
+    tui.emit("session.execution.interrupted", { sessionID: "a" });
+    expect(calls).toBe(2);
+    if (laterOutcome === "success") finish[1]();
+    // The newest sync has settled (or failed), but the older one is still in flight.
+    await advance(100);
+    expect(tui.permissions.get("a")).toEqual([]);
+    finish[0]();
+    await flushReports();
+    expect(tui.permissions.get("a")).toEqual([{ id: "replied" }]);
+    expect(states()).not.toContain("blocked");
+    expect(states()).not.toContain("idle");
+    await advance(900);
+    expect(states()).not.toContain("idle");
+    await advance(700);
+    expect(states().at(-1)).toBe("idle");
+    expect(states()).not.toContain("blocked");
+    // Once all syncs have settled and the cache drops the old row, new asks work.
+    tui.permissions.set("a", []);
+    await advance(100);
+    tui.permissions.set("a", [{ id: "new" }]);
+    await advance(100);
+    expect(states().at(-1)).toBe("blocked");
+    dispose();
+  }
+});
+
 test("regression: earlier running sibling cannot prevent later execution delta reconciliation", async () => {
   const tui = v2Api();
   tui.sessions.set("later", { id: "later", parentID: "a" });
@@ -565,7 +617,9 @@ test("V2 follows live TUI autoaccept settings on and off without restarting", as
   expect(states().at(-1)).toBe("working");
   await advance(100);
   expect(states()).not.toContain("blocked");
-  await writeFile(`${configDir}/cli.json`, '{"session":{"permissions":"prompt"}}');
+  // The host saves config with an atomic rename, not an in-place write.
+  await writeFile(`${configDir}/cli.json.tmp`, '{"session":{"permissions":"prompt"}}');
+  await rename(`${configDir}/cli.json.tmp`, `${configDir}/cli.json`);
   await advance(100);
   expect(states().at(-1)).toBe("blocked");
   tui.emit("permission.replied", { sessionID: "a", requestID: "auto" });

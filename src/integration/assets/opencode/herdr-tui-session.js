@@ -7,6 +7,7 @@
 import net from "node:net";
 import { appendFile, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { watch } from "node:fs";
 import path from "node:path";
 
 const AGENT = isShuvcodeHost() ? "shuvcode" : "opencode";
@@ -15,6 +16,7 @@ const ROUTE_POLL_INTERVAL_MS = 100;
 const SELECTION_RETRY_DELAYS_MS = [100, 400, 1_000];
 const IDLE_DELAY_MS = 1_500;
 const AUTO_BLOCKED_DELAY_MS = 500;
+const CONFIG_POLL_INTERVAL_MS = 1_000;
 
 // The host reads JSONC (comments and trailing commas) even in cli.json.
 // Preserve quoted strings when removing either, including URLs and escaped quotes.
@@ -200,6 +202,9 @@ function setup(api) {
   const inlineMode = cliPermissionMode(process.env.OPENCODE_CLI_CONFIG_CONTENT);
   let autoAccept = cliAuto || inlineMode === "autoaccept";
   let modePending = false;
+  let modeWatcher;
+  let modeDirty = true;
+  let nextModeReadAt = 0;
   let blockers = new Map();
   // Keep dead permission keys suppressed until their owner's cache drops them.
   const expired = new Map();
@@ -278,6 +283,11 @@ function setup(api) {
 
   function refreshPermissionMode() {
     if (disposed || modePending || cliAuto || inlineMode !== undefined) return;
+    // File events refresh immediately; a 1s safety poll covers missed events or
+    // directory replacement without reading config on every 100ms route tick.
+    if (!modeDirty && Date.now() < nextModeReadAt) return;
+    modeDirty = false;
+    nextModeReadAt = Date.now() + CONFIG_POLL_INTERVAL_MS;
     modePending = true;
     void readFile(configPath, "utf8").catch(() => undefined).then((text) => {
       if (disposed) return;
@@ -286,6 +296,14 @@ function setup(api) {
       autoAccept = next;
       if (selected) publish("permission-mode");
     }).finally(() => { modePending = false; });
+  }
+
+  function finishPermissionSync(member, token, revision) {
+    if (disposed || revision !== generation) return false;
+    const pending = permissionSyncs.get(member);
+    pending?.delete(token);
+    if (pending?.size === 0) permissionSyncs.delete(member);
+    return !!selected;
   }
 
   function effective() {
@@ -338,26 +356,26 @@ function setup(api) {
     }
     const permission = api.data.session.permission;
     for (const item of permission.list(member) ?? []) expired.set(`permission:${item.id}`, member);
+    const revision = generation;
+    let token;
     try {
       if (typeof permission.invalidate === "function") permission.invalidate(member);
       if (typeof permission.sync === "function") {
-        const revision = generation;
-        const token = {};
-        permissionSyncs.set(member, token);
+        token = {};
+        const pending = permissionSyncs.get(member) ?? new Set();
+        pending.add(token);
+        permissionSyncs.set(member, pending);
         void Promise.resolve(permission.sync(member)).then(() => {
-          if (!disposed && revision === generation && selected) {
-            if (permissionSyncs.get(member) === token) permissionSyncs.delete(member);
+          if (finishPermissionSync(member, token, revision)) {
             reconcileBlockers();
             publish("permission-sync");
           }
         }, () => {
-          if (!disposed && revision === generation && permissionSyncs.get(member) === token) {
-            permissionSyncs.delete(member);
-          }
+          finishPermissionSync(member, token, revision);
         });
       }
     } catch {
-      permissionSyncs.delete(member);
+      if (token) finishPermissionSync(member, token, revision);
       // Best effort: expired keys already hide the dead asks.
     }
     reconcileBlockers();
@@ -516,6 +534,23 @@ function setup(api) {
   }
 
   const unsubscribe = api.data.listen(receive);
+  if (!cliAuto && inlineMode === undefined) {
+    try {
+      // Watch the directory to follow atomic cli.json replacements, like the host.
+      modeWatcher = watch(path.dirname(configPath), (_event, name) => {
+        if (name && name.toString() !== "cli.json") return;
+        modeDirty = true;
+        refreshPermissionMode();
+      });
+      modeWatcher.on("error", () => {
+        modeWatcher?.close();
+        modeWatcher = undefined;
+      });
+      modeWatcher.unref?.();
+    } catch {
+      // Missing directories or unavailable watchers use the throttled poll.
+    }
+  }
   refreshPermissionMode();
   syncSelection();
   const poll = setInterval(() => {
@@ -527,6 +562,7 @@ function setup(api) {
     generation += 1;
     clearTimeout(retryTimer);
     clearInterval(poll);
+    modeWatcher?.close();
     unsubscribe();
     sessions.clear();
     ancestorSyncs.clear();
