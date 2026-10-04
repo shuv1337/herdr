@@ -619,6 +619,8 @@ test("V2 follows live TUI autoaccept settings on and off without restarting", as
   expect(states()).not.toContain("blocked");
   // The host saves config with an atomic rename, not an in-place write.
   await writeFile(`${configDir}/cli.json.tmp`, '{"session":{"permissions":"prompt"}}');
+  // Some runtimes coalesce back-to-back events for one directory entry.
+  await flushReports();
   await rename(`${configDir}/cli.json.tmp`, `${configDir}/cli.json`);
   await advance(100);
   expect(states().at(-1)).toBe("blocked");

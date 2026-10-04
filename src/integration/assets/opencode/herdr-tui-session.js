@@ -537,8 +537,9 @@ function setup(api) {
   if (!cliAuto && inlineMode === undefined) {
     try {
       // Watch the directory to follow atomic cli.json replacements, like the host.
-      modeWatcher = watch(path.dirname(configPath), (_event, name) => {
-        if (name && name.toString() !== "cli.json") return;
+      // Runtimes may report a rename under the temp file's name, so any entry
+      // change in the directory rereads the config.
+      modeWatcher = watch(path.dirname(configPath), () => {
         modeDirty = true;
         refreshPermissionMode();
       });
