@@ -283,7 +283,7 @@ function setup(api) {
     }
     if (changed || force) enqueue(value);
     // Retrying this source separately also retries a dropped label/clear report.
-    if (changed || force) enqueue(undefined, failed);
+    if (force) enqueue(undefined, failed);
   }
 
   function settleMember(member) {
@@ -383,8 +383,11 @@ function setup(api) {
     }
     if (!id) return;
     reconcileBlockers();
+    const raw = effective();
+    if (raw !== "idle") idleAt = undefined;
+    if (raw !== "blocked") blockedAt = undefined;
     if (Date.now() < nextSelectionAt) {
-      if (effective() !== published) publish("reconcile");
+      if (raw !== published) publish("reconcile");
       return;
     }
     enqueue(undefined);

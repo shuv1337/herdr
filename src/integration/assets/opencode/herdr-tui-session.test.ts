@@ -633,6 +633,39 @@ test("V2 reconciles descendant activity from the cache even without lifecycle ev
   expect(states().at(-1)).toBe("idle");
 });
 
+test("V2 reports a failed label once per failure across later state flips", async () => {
+  const { tui } = await startV2();
+  for (let i = 0; i < 3; i++) await advance(1_600);
+  requests.length = 0;
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("session.execution.failed", { sessionID: "a" });
+  await advance(1_600);
+  tui.statuses.set("child", "running");
+  await advance(100);
+  tui.statuses.set("child", "idle");
+  await advance(100);
+  await advance(1_600);
+  expect(states().slice(-3)).toEqual(["idle", "working", "idle"]);
+  expect(metadata().filter((r) => requestParam(r, "state_labels") !== undefined)).toHaveLength(1);
+  expect(metadata().filter((r) => requestParam(r, "clear_state_labels") === true)).toHaveLength(1);
+});
+
+test("V2 restarts the idle debounce after cache-only activity resumes", async () => {
+  const { tui } = await startV2();
+  for (let i = 0; i < 3; i++) await advance(1_600);
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("session.execution.succeeded", { sessionID: "a" });
+  await advance(100);
+  tui.statuses.set("child", "running");
+  await advance(2_000);
+  expect(states().at(-1)).toBe("working");
+  tui.statuses.set("child", "idle");
+  await advance(100);
+  expect(states().at(-1)).toBe("working");
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+});
+
 test("V2 failed parent remains working while descendants run without losing its label", async () => {
   const { tui } = await startV2();
   tui.emit("session.execution.started", { sessionID: "a" });
