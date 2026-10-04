@@ -190,7 +190,7 @@ const OPENCODE_V2_TUI_PLUGIN_ASSET: &str = include_str!("assets/opencode/tui.js"
 /// Directory left by the fork's pre-upstream OpenCode v2 package layout.
 const OPENCODE_FORK_V2_PACKAGE_DIR: &str = "herdr-agent-state";
 const OPENCODE_FORK_V1_RENAMED_PLUGIN: &str = "herdr-agent-state-v1.js";
-const OPENCODE_INTEGRATION_VERSION: u32 = 12;
+const OPENCODE_INTEGRATION_VERSION: u32 = 13;
 const KILO_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state.js";
 const KILO_PLUGIN_ASSET: &str = include_str!("assets/kilo/herdr-agent-state.js");
 const KILO_INTEGRATION_VERSION: u32 = 4;

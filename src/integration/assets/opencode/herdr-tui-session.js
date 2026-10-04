@@ -1,15 +1,18 @@
 // installed by herdr
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // HERDR_INTEGRATION_ID=opencode-tui
-// HERDR_INTEGRATION_VERSION=12
+// HERDR_INTEGRATION_VERSION=13
 // V2 TUI entrypoint herdr-opencode/tui.js re-exports this file.
 
 import net from "node:net";
+import { appendFile } from "node:fs/promises";
 
 const AGENT = isShuvcodeHost() ? "shuvcode" : "opencode";
 const SOURCE = `herdr:${AGENT}`;
 const ROUTE_POLL_INTERVAL_MS = 100;
 const SELECTION_RETRY_DELAYS_MS = [100, 400, 1_000];
+const IDLE_DELAY_MS = 1_500;
+const AUTO_BLOCKED_DELAY_MS = 500;
 
 function isShuvcodeHost() {
   if (/(?:^|[\\/])shuvcode[\\/]plugins[\\/]/i.test(import.meta.url)) {
@@ -25,7 +28,7 @@ function isShuvcodeHost() {
   return typeof configDir === "string" && /(?:^|[\\/])shuvcode[\\/]?$/i.test(configDir);
 }
 
-function requestOnce(sessionID, state, seq, isCurrent = () => true) {
+function requestOnce(sessionID, state, seq, isCurrent = () => true, failedLabel) {
   const paneId = process.env.HERDR_PANE_ID;
   const socketPath = process.env.HERDR_SOCKET_PATH;
   if (!paneId || !socketPath) {
@@ -38,8 +41,15 @@ function requestOnce(sessionID, state, seq, isCurrent = () => true) {
     id: `${SOURCE}:tui:${Date.now()}:${Math.floor(Math.random() * 1_000_000)
       .toString()
       .padStart(6, "0")}`,
-    method: state === undefined ? "pane.report_agent_session" : "pane.report_agent",
-    params: {
+    method: failedLabel !== undefined ? "pane.report_metadata" : state === undefined ? "pane.report_agent_session" : "pane.report_agent",
+    params: failedLabel !== undefined ? {
+      pane_id: paneId,
+      source: `${SOURCE}:turn`,
+      agent: AGENT,
+      applies_to_source: SOURCE,
+      seq,
+      ...(failedLabel ? { state_labels: { idle: "failed", done: "failed" } } : { clear_state_labels: true }),
+    } : {
       pane_id: paneId,
       source: SOURCE,
       agent: AGENT,
@@ -153,9 +163,17 @@ function setup(api) {
   let retryIndex = 0;
   let nextSelectionAt = 0;
   let state = "idle";
+  let failed = false;
+  let published;
+  let idleAt;
+  let blockedAt;
   let retryTimer;
   const sessions = new Map();
+  const ancestorSyncs = new Map();
+  const executionChanges = new Map();
   let blockers = new Map();
+  // Keep dead permission keys suppressed until their owner's cache drops them.
+  const expired = new Map();
   // Event callbacks may precede cache updates. Retain each delta until the
   // cache reflects it, so late hydration cannot undo a reply or lose an ask.
   const blockerChanges = new Map();
@@ -165,9 +183,26 @@ function setup(api) {
     while (typeof id === "string" && !seen.has(id)) {
       seen.add(id);
       const session = api.data.session.get(id) ?? sessions.get(id);
-      if (!session) return;
+      if (!session) {
+        syncAncestor(id);
+        return;
+      }
       if (!session.parentID) return id;
       id = session.parentID;
+    }
+  }
+
+  function syncAncestor(id) {
+    if (disposed || typeof api.data.session.sync !== "function" || Date.now() < (ancestorSyncs.get(id) ?? 0)) return;
+    ancestorSyncs.set(id, Number.POSITIVE_INFINITY);
+    try {
+      void Promise.resolve(api.data.session.sync(id)).catch(() => {}).finally(() => {
+        if (disposed) return;
+        ancestorSyncs.set(id, Date.now() + 1_000);
+        syncSelection();
+      });
+    } catch {
+      ancestorSyncs.set(id, Date.now() + 1_000);
     }
   }
 
@@ -178,13 +213,13 @@ function setup(api) {
 
   // Selection and lifecycle use one queue. Recheck attribution at dispatch,
   // not just when receiving the event, and reject A -> B -> A stale work too.
-  function enqueue(value) {
+  function enqueue(value, failedLabel) {
     const sessionID = selected;
     const revision = generation;
     const isCurrent = () => !disposed && revision === generation && !!sessionID && current() === sessionID;
     chain = chain.then(async () => {
       if (!isCurrent()) return;
-      const delivered = await requestOnce(sessionID, value, value === undefined ? undefined : ++sequence, isCurrent);
+      const delivered = await requestOnce(sessionID, value, value === undefined && failedLabel === undefined ? undefined : ++sequence, isCurrent, failedLabel);
       if (!delivered) scheduleStateRetry();
     }).catch(() => {});
   }
@@ -196,18 +231,93 @@ function setup(api) {
     if (disposed || retryTimer) return;
     retryTimer = setTimeout(() => {
       retryTimer = undefined;
-      publish();
+      publish("delivery-retry", true);
     }, 500);
     retryTimer.unref?.();
   }
 
-  function publish() {
-    enqueue(blockers.size ? "blocked" : state);
+  function familyActive() {
+    for (const member of api.data.session.family(selected)) {
+      if (member === selected || root(member) !== selected) continue;
+      const running = api.data.session.status(member) === "running";
+      if (executionChanges.get(member) === running) executionChanges.delete(member);
+      if (executionChanges.get(member) ?? running) return true;
+    }
+    return false;
+  }
+
+  function effective() {
+    if (blockers.size) return "blocked";
+    return state === "working" || familyActive() ? "working" : "idle";
+  }
+
+  function publish(reason, force = false) {
+    const raw = effective();
+    let value = raw;
+    const route = api.ui.router.current();
+    // Only root-route autoaccept permissions are expected to resolve themselves.
+    // Forms, prompt mode, and child-route --auto stalls need immediate attention.
+    // V2's public plugin API has no permission-mode accessor. --auto guarantees
+    // autoaccept; without it, conservatively keep prompt-mode asks immediate.
+    const auto = process.argv.includes("--auto");
+    if (raw === "blocked" && auto && route.sessionID === selected &&
+      [...blockers.keys()].every((key) => key.startsWith("permission:")) && published !== "blocked") {
+      blockedAt ??= Date.now() + AUTO_BLOCKED_DELAY_MS;
+      if (Date.now() < blockedAt) value = state === "working" || familyActive() ? "working" : "idle";
+    } else {
+      blockedAt = undefined;
+    }
+    if (raw === "idle" && published === "working") {
+      idleAt ??= Date.now() + IDLE_DELAY_MS;
+      if (Date.now() < idleAt) value = "working";
+    } else {
+      idleAt = undefined;
+    }
+    const changed = published !== value;
+    published = value;
+    // Opt-in, content-free diagnostics; trace I/O must never delay status delivery.
+    if (process.env.HERDR_OPENCODE_TRACE) {
+      const entry = { t: Date.now(), reason, route: { type: route.type, sessionID: route.sessionID }, root: selected, rootState: state,
+        failed, blockers: [...blockers].map(([key, owner]) => ({ key, owner })), raw, state: value };
+      void appendFile(process.env.HERDR_OPENCODE_TRACE, `${JSON.stringify(entry)}\n`).catch(() => {});
+    }
+    if (changed || force) enqueue(value);
+    // Retrying this source separately also retries a dropped label/clear report.
+    if (force) enqueue(undefined, failed);
+  }
+
+  function settleMember(member) {
+    for (const [key, owner] of blockers) {
+      if (owner === member && key.startsWith("permission:")) expired.set(key, owner);
+    }
+    for (const [key, change] of blockerChanges) {
+      if (change.id === member && change.kind === "permission") {
+        if (change.present) expired.set(key, member);
+        blockerChanges.delete(key);
+      }
+    }
+    const permission = api.data.session.permission;
+    try {
+      if (typeof permission.invalidate === "function") permission.invalidate(member);
+      if (typeof permission.sync === "function") {
+        const revision = generation;
+        void Promise.resolve(permission.sync(member)).then(() => {
+          if (!disposed && revision === generation && selected) {
+            reconcileBlockers();
+            publish("permission-sync");
+          }
+        }, () => {});
+      }
+    } catch {
+      // Best effort: expired keys already hide the dead asks.
+    }
+    reconcileBlockers();
   }
 
   function changeBlocker(id, kind, requestID, present) {
     if (typeof requestID !== "string") return;
     const key = `${kind}:${requestID}`;
+    if (present) expired.delete(key);
     blockerChanges.set(key, { id, kind, present });
     if (present) blockers.set(key, id);
     else blockers.delete(key);
@@ -216,19 +326,24 @@ function setup(api) {
   function reconcileBlockers() {
     const next = new Map();
     const hydrated = new Set();
-    const members = new Set([selected, ...api.data.session.family(selected), ...blockers.values()]);
+    const cached = new Set();
+    const members = new Set([selected, ...api.data.session.family(selected), ...blockers.values(), ...expired.values()]);
     for (const member of members) {
       if (root(member) !== selected) continue;
       for (const kind of ["permission", "form"]) {
         const items = api.data.session[kind].list(member);
         if (items === undefined) {
           for (const [key, owner] of blockers) {
-            if (owner === member && key.startsWith(`${kind}:`)) next.set(key, owner);
+            if (owner === member && key.startsWith(`${kind}:`) && !expired.has(key)) next.set(key, owner);
           }
           continue;
         }
         hydrated.add(`${kind}:${member}`);
-        for (const item of items) next.set(`${kind}:${item.id}`, member);
+        for (const item of items) {
+          const key = `${kind}:${item.id}`;
+          cached.add(key);
+          if (!expired.has(key)) next.set(key, member);
+        }
       }
     }
     for (const [key, change] of blockerChanges) {
@@ -240,9 +355,10 @@ function setup(api) {
         next.delete(key);
       }
     }
-    const changed = (blockers.size > 0) !== (next.size > 0);
+    for (const [key, owner] of expired) {
+      if (hydrated.has(`permission:${owner}`) && !cached.has(key)) expired.delete(key);
+    }
     blockers = next;
-    return changed;
   }
 
   function syncSelection() {
@@ -255,18 +371,27 @@ function setup(api) {
       nextSelectionAt = 0;
       blockers.clear();
       blockerChanges.clear();
+      expired.clear();
+      executionChanges.clear();
+      failed = false;
+      published = undefined;
+      idleAt = undefined;
+      blockedAt = undefined;
       if (id) {
         state = api.data.session.status(id) === "running" ? "working" : "idle";
       }
     }
     if (!id) return;
-    const blockersChanged = reconcileBlockers();
+    reconcileBlockers();
+    const raw = effective();
+    if (raw !== "idle") idleAt = undefined;
+    if (raw !== "blocked") blockedAt = undefined;
     if (Date.now() < nextSelectionAt) {
-      if (blockersChanged) publish();
+      if (raw !== published) publish("reconcile");
       return;
     }
     enqueue(undefined);
-    publish();
+    publish("selection", true);
     const delay = SELECTION_RETRY_DELAYS_MS[retryIndex++];
     nextSelectionAt = delay === undefined ? Number.POSITIVE_INFINITY : Date.now() + delay;
   }
@@ -281,14 +406,16 @@ function setup(api) {
     if (event.type === "session.deleted") {
       const affected = data.sessionID === selected || [...blockers.values()].includes(data.sessionID);
       sessions.delete(data.sessionID);
+      executionChanges.delete(data.sessionID);
       // Deletion is delivered after the cache can remove the session. Use
       // stored ownership rather than looking up the deleted child's ancestry.
       for (const [key, owner] of blockers) if (owner === data.sessionID) blockers.delete(key);
       for (const [key, change] of blockerChanges) {
         if (change.id === data.sessionID) blockerChanges.delete(key);
       }
+      for (const [key, owner] of expired) if (owner === data.sessionID) expired.delete(key);
       syncSelection();
-      if (selected && affected) publish();
+      if (selected && affected) publish(event.type);
       return;
     }
     syncSelection();
@@ -309,22 +436,30 @@ function setup(api) {
         changeBlocker(id, "form", data.id, false);
         break;
       case "session.execution.started":
-        if (id !== selected) return;
-        state = "working";
+        executionChanges.set(id, true);
+        if (id === selected) {
+          state = "working";
+          failed = false;
+          enqueue(undefined, false);
+        }
         break;
       case "session.execution.succeeded":
       case "session.execution.interrupted":
-        if (id !== selected) return;
-        state = "idle";
-        break;
       case "session.execution.failed":
-        if (id !== selected) return;
-        state = "blocked";
+        executionChanges.set(id, false);
+        settleMember(id);
+        if (id === selected) {
+          state = "idle";
+          if (event.type === "session.execution.failed") {
+            failed = true;
+            enqueue(undefined, true);
+          }
+        }
         break;
       default:
         return;
     }
-    publish();
+    publish(event.type);
   }
 
   const unsubscribe = api.data.listen(receive);
@@ -337,7 +472,10 @@ function setup(api) {
     clearInterval(poll);
     unsubscribe();
     sessions.clear();
+    ancestorSyncs.clear();
+    executionChanges.clear();
     blockers.clear();
     blockerChanges.clear();
+    expired.clear();
   };
 }
