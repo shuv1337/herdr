@@ -12,6 +12,7 @@ const connections: Array<() => void> = [];
 const realNow = Date.now;
 const originalArgv = [...process.argv];
 let configDir: string;
+let configTracePath: string;
 let clockOffset = 0;
 let clock: ReturnType<typeof spyOn>;
 
@@ -53,6 +54,8 @@ mock.module("node:net", () => ({
 beforeEach(async () => {
   await mkdir(".local", { recursive: true });
   configDir = await mkdtemp(".local/herdr-tui-config-");
+  // Keep observation output outside the watched directory to avoid extra events.
+  configTracePath = `${configDir}.publish.jsonl`;
   clockOffset = 0;
   clock = spyOn(Date, "now").mockImplementation(() => realNow() + clockOffset);
   process.argv = [...originalArgv];
@@ -79,6 +82,7 @@ afterEach(async () => {
   delete process.env.HERDR_OPENCODE_TRACE;
   delete process.env.OPENCODE_CLI_CONFIG_CONTENT;
   await rm(configDir, { recursive: true, force: true });
+  await rm(configTracePath, { force: true });
 });
 
 async function loadPlugin() {
@@ -297,6 +301,29 @@ const advance = async (ms: number) => {
   clockOffset += ms;
   await new Promise((resolve) => setTimeout(resolve, 120));
 };
+
+// The opt-in trace is an observable publish contract: permission-mode is written
+// only after the new setting has been read and applied. Wait for that signal,
+// not for filesystem notifications to happen within one arbitrary timer tick.
+async function waitForPermissionModeTrace(path: string, count: number, advanceClock = true) {
+  const deadline = realNow() + 3_000;
+  while (realNow() < deadline) {
+    const text = await readFile(path, "utf8").catch(() => "");
+    const changes = text.split("\n").filter((line) => {
+      try {
+        return JSON.parse(line).reason === "permission-mode";
+      } catch {
+        // A concurrently appended line may not yet be complete.
+        return false;
+      }
+    });
+    if (changes.length >= count) return;
+    if (advanceClock) await advance(200); // Drive the real 1s safety-poll path too.
+    else await flushReports();
+  }
+  throw new Error(`Timed out waiting for ${count} permission-mode trace entries`);
+}
+
 const states = () => requests.filter((r) => requestParam(r, "state") !== undefined)
   .map((r) => requestParam(r, "state"));
 const metadata = () => requests.filter((r) => isRecord(r) && r.method === "pane.report_metadata");
@@ -608,9 +635,11 @@ test("regression: earlier running sibling cannot prevent later execution delta r
 });
 
 test("V2 follows live TUI autoaccept settings on and off without restarting", async () => {
+  const tracePath = configTracePath;
+  process.env.HERDR_OPENCODE_TRACE = tracePath;
   const { tui } = await startV2();
   await writeFile(`${configDir}/cli.json`, '{"session":{"permissions":"autoaccept"}}');
-  await advance(100);
+  await waitForPermissionModeTrace(tracePath, 1);
   tui.emit("session.execution.started", { sessionID: "a" });
   tui.emit("permission.asked", { sessionID: "a", id: "auto" });
   await flushReports();
@@ -619,13 +648,32 @@ test("V2 follows live TUI autoaccept settings on and off without restarting", as
   expect(states()).not.toContain("blocked");
   // The host saves config with an atomic rename, not an in-place write.
   await writeFile(`${configDir}/cli.json.tmp`, '{"session":{"permissions":"prompt"}}');
-  // Some runtimes coalesce back-to-back events for one directory entry.
-  await flushReports();
   await rename(`${configDir}/cli.json.tmp`, `${configDir}/cli.json`);
-  await advance(100);
+  await waitForPermissionModeTrace(tracePath, 2);
+  await flushReports();
   expect(states().at(-1)).toBe("blocked");
+  // A persistent ask could become blocked just from the 500ms edge timeout.
+  // A fresh ask must now block immediately, proving prompt mode was applied.
   tui.emit("permission.replied", { sessionID: "a", requestID: "auto" });
   tui.emit("permission.asked", { sessionID: "a", id: "prompt" });
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
+});
+
+test("V2 watches atomic config renames even when the runtime reports the temp filename", async () => {
+  const now = Date.now();
+  clock.mockImplementation(() => now); // The safety-poll deadline cannot elapse.
+  const tracePath = configTracePath;
+  process.env.HERDR_OPENCODE_TRACE = tracePath;
+  await writeFile(`${configDir}/cli.json`, '{"session":{"permissions":"autoaccept"}}');
+  // Prepare before the watcher starts: only the atomic rename can notify it.
+  await writeFile(`${configDir}/cli.json.tmp`, '{"session":{"permissions":"prompt"}}');
+  const { tui } = await startV2();
+  await waitForPermissionModeTrace(tracePath, 1, false);
+  await rename(`${configDir}/cli.json.tmp`, `${configDir}/cli.json`);
+  await waitForPermissionModeTrace(tracePath, 2, false);
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("permission.asked", { sessionID: "a", id: "prompt-after-rename" });
   await flushReports();
   expect(states().at(-1)).toBe("blocked");
 });
