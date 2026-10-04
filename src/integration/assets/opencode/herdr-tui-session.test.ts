@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import path from "node:path";
 
 const requests: unknown[] = [];
 const activeDisposers: Array<() => void> = [];
@@ -658,6 +661,42 @@ test("V2 follows live TUI autoaccept settings on and off without restarting", as
   tui.emit("permission.asked", { sessionID: "a", id: "prompt" });
   await flushReports();
   expect(states().at(-1)).toBe("blocked");
+});
+
+test("V2 treats an empty config override as unset and watches the home config directory", async () => {
+  const originalConfigHome = process.env.XDG_CONFIG_HOME;
+  const homeConfig = path.join(configDir, "home", ".config");
+  const agentConfig = path.join(homeConfig, "opencode");
+  await mkdir(agentConfig, { recursive: true });
+  await writeFile(path.join(agentConfig, "cli.json"), '{"session":{"permissions":"autoaccept"}}');
+  process.env.OPENCODE_CONFIG_DIR = "";
+  delete process.env.XDG_CONFIG_HOME;
+  process.env.HERDR_OPENCODE_TRACE = configTracePath;
+  const now = Date.now();
+  clock.mockImplementation(() => now); // Only the correct watcher can observe the next edit.
+  const watcher = spyOn(fs, "watch");
+  const home = spyOn(os, "homedir").mockReturnValue(path.join(configDir, "home"));
+  try {
+    const { tui } = await startV2();
+    // Observe the real watch registration, not implementation source or timing.
+    expect(watcher.mock.calls.map((call) => call[0])).toEqual([agentConfig]);
+    await waitForPermissionModeTrace(configTracePath, 1, false);
+    tui.emit("session.execution.started", { sessionID: "a" });
+    tui.emit("permission.asked", { sessionID: "a", id: "home-autoaccept" });
+    await flushReports();
+    expect(states().at(-1)).toBe("working");
+    expect(states()).not.toContain("blocked");
+
+    await writeFile(path.join(agentConfig, "cli.json"), '{"session":{"permissions":"prompt"}}');
+    await waitForPermissionModeTrace(configTracePath, 2, false);
+    await flushReports();
+    expect(states().at(-1)).toBe("blocked");
+  } finally {
+    watcher.mockRestore();
+    home.mockRestore();
+    if (originalConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = originalConfigHome;
+  }
 });
 
 test("V2 watches atomic config renames even when the runtime reports the temp filename", async () => {

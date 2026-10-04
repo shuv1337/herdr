@@ -197,7 +197,7 @@ function setup(api) {
   const args = process.argv.slice(2);
   const cliAuto = args.slice(0, args.indexOf("--") < 0 ? args.length : args.indexOf("--"))
     .some((arg) => ["--auto", "--yolo", "--dangerously-skip-permissions"].includes(arg));
-  const configPath = path.join(process.env.OPENCODE_CONFIG_DIR ??
+  const configPath = path.join(process.env.OPENCODE_CONFIG_DIR ||
     path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), AGENT), "cli.json");
   const inlineMode = cliPermissionMode(process.env.OPENCODE_CLI_CONFIG_CONTENT);
   let autoAccept = cliAuto || inlineMode === "autoaccept";
