@@ -5,7 +5,9 @@
 // V2 TUI entrypoint herdr-opencode/tui.js re-exports this file.
 
 import net from "node:net";
-import { appendFile } from "node:fs/promises";
+import { appendFile, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import path from "node:path";
 
 const AGENT = isShuvcodeHost() ? "shuvcode" : "opencode";
 const SOURCE = `herdr:${AGENT}`;
@@ -13,6 +15,21 @@ const ROUTE_POLL_INTERVAL_MS = 100;
 const SELECTION_RETRY_DELAYS_MS = [100, 400, 1_000];
 const IDLE_DELAY_MS = 1_500;
 const AUTO_BLOCKED_DELAY_MS = 500;
+
+// The host reads JSONC (comments and trailing commas) even in cli.json.
+// Preserve quoted strings when removing either, including URLs and escaped quotes.
+function cliPermissionMode(text) {
+  if (!text) return;
+  try {
+    const json = text.replace(/("(?:\\.|[^"\\])*")|\/\/[^\r\n]*|\/\*[\s\S]*?\*\//g,
+      (match, string) => string ?? " ").replace(/("(?:\\.|[^"\\])*")|,\s*(?=[}\]])/g,
+      (match, string) => string ?? "");
+    const mode = JSON.parse(json)?.session?.permissions;
+    return mode === "autoaccept" || mode === "prompt" ? mode : undefined;
+  } catch {
+    // Invalid or unavailable config is not evidence of autoaccept.
+  }
+}
 
 function isShuvcodeHost() {
   if (/(?:^|[\\/])shuvcode[\\/]plugins[\\/]/i.test(import.meta.url)) {
@@ -171,6 +188,18 @@ function setup(api) {
   const sessions = new Map();
   const ancestorSyncs = new Map();
   const executionChanges = new Map();
+  const permissionSyncs = new Map();
+  // Context exposes neither app permissions.autoApprove, TUI config nor args.auto.
+  // Best available live TUI signal: persisted session.permissions + inline overlay.
+  // CLI aliases force autoaccept in usePermission, even when the config says prompt.
+  const args = process.argv.slice(2);
+  const cliAuto = args.slice(0, args.indexOf("--") < 0 ? args.length : args.indexOf("--"))
+    .some((arg) => ["--auto", "--yolo", "--dangerously-skip-permissions"].includes(arg));
+  const configPath = path.join(process.env.OPENCODE_CONFIG_DIR ??
+    path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), AGENT), "cli.json");
+  const inlineMode = cliPermissionMode(process.env.OPENCODE_CLI_CONFIG_CONTENT);
+  let autoAccept = cliAuto || inlineMode === "autoaccept";
+  let modePending = false;
   let blockers = new Map();
   // Keep dead permission keys suppressed until their owner's cache drops them.
   const expired = new Map();
@@ -237,13 +266,26 @@ function setup(api) {
   }
 
   function familyActive() {
+    let active = false;
     for (const member of api.data.session.family(selected)) {
       if (member === selected || root(member) !== selected) continue;
       const running = api.data.session.status(member) === "running";
       if (executionChanges.get(member) === running) executionChanges.delete(member);
-      if (executionChanges.get(member) ?? running) return true;
+      if (executionChanges.get(member) ?? running) active = true;
     }
-    return false;
+    return active;
+  }
+
+  function refreshPermissionMode() {
+    if (disposed || modePending || cliAuto || inlineMode !== undefined) return;
+    modePending = true;
+    void readFile(configPath, "utf8").catch(() => undefined).then((text) => {
+      if (disposed) return;
+      const next = cliPermissionMode(text) === "autoaccept";
+      if (next === autoAccept) return;
+      autoAccept = next;
+      if (selected) publish("permission-mode");
+    }).finally(() => { modePending = false; });
   }
 
   function effective() {
@@ -256,11 +298,8 @@ function setup(api) {
     let value = raw;
     const route = api.ui.router.current();
     // Only root-route autoaccept permissions are expected to resolve themselves.
-    // Forms, prompt mode, and child-route --auto stalls need immediate attention.
-    // V2's public plugin API has no permission-mode accessor. --auto guarantees
-    // autoaccept; without it, conservatively keep prompt-mode asks immediate.
-    const auto = process.argv.includes("--auto");
-    if (raw === "blocked" && auto && route.sessionID === selected &&
+    // Forms, prompt mode, and child-route autoaccept stalls need immediate attention.
+    if (raw === "blocked" && autoAccept && route.sessionID === selected &&
       [...blockers.keys()].every((key) => key.startsWith("permission:")) && published !== "blocked") {
       blockedAt ??= Date.now() + AUTO_BLOCKED_DELAY_MS;
       if (Date.now() < blockedAt) value = state === "working" || familyActive() ? "working" : "idle";
@@ -292,23 +331,33 @@ function setup(api) {
     }
     for (const [key, change] of blockerChanges) {
       if (change.id === member && change.kind === "permission") {
-        if (change.present) expired.set(key, member);
+        // Replies are tombstones too: a blind sync can still return their IDs.
+        expired.set(key, member);
         blockerChanges.delete(key);
       }
     }
     const permission = api.data.session.permission;
+    for (const item of permission.list(member) ?? []) expired.set(`permission:${item.id}`, member);
     try {
       if (typeof permission.invalidate === "function") permission.invalidate(member);
       if (typeof permission.sync === "function") {
         const revision = generation;
+        const token = {};
+        permissionSyncs.set(member, token);
         void Promise.resolve(permission.sync(member)).then(() => {
           if (!disposed && revision === generation && selected) {
+            if (permissionSyncs.get(member) === token) permissionSyncs.delete(member);
             reconcileBlockers();
             publish("permission-sync");
           }
-        }, () => {});
+        }, () => {
+          if (!disposed && revision === generation && permissionSyncs.get(member) === token) {
+            permissionSyncs.delete(member);
+          }
+        });
       }
     } catch {
+      permissionSyncs.delete(member);
       // Best effort: expired keys already hide the dead asks.
     }
     reconcileBlockers();
@@ -347,7 +396,8 @@ function setup(api) {
       }
     }
     for (const [key, change] of blockerChanges) {
-      if (hydrated.has(`${change.kind}:${change.id}`) && next.has(key) === change.present) {
+      if (hydrated.has(`${change.kind}:${change.id}`) && next.has(key) === change.present &&
+        (change.kind !== "permission" || change.present || expired.has(key))) {
         blockerChanges.delete(key);
       } else if (change.present) {
         next.set(key, change.id);
@@ -356,7 +406,8 @@ function setup(api) {
       }
     }
     for (const [key, owner] of expired) {
-      if (hydrated.has(`permission:${owner}`) && !cached.has(key)) expired.delete(key);
+      // A pending refresh can blindly replace an empty cache with stale rows.
+      if (!permissionSyncs.has(owner) && hydrated.has(`permission:${owner}`) && !cached.has(key)) expired.delete(key);
     }
     blockers = next;
   }
@@ -373,6 +424,7 @@ function setup(api) {
       blockerChanges.clear();
       expired.clear();
       executionChanges.clear();
+      permissionSyncs.clear();
       failed = false;
       published = undefined;
       idleAt = undefined;
@@ -407,6 +459,7 @@ function setup(api) {
       const affected = data.sessionID === selected || [...blockers.values()].includes(data.sessionID);
       sessions.delete(data.sessionID);
       executionChanges.delete(data.sessionID);
+      permissionSyncs.delete(data.sessionID);
       // Deletion is delivered after the cache can remove the session. Use
       // stored ownership rather than looking up the deleted child's ancestry.
       for (const [key, owner] of blockers) if (owner === data.sessionID) blockers.delete(key);
@@ -463,8 +516,12 @@ function setup(api) {
   }
 
   const unsubscribe = api.data.listen(receive);
+  refreshPermissionMode();
   syncSelection();
-  const poll = setInterval(syncSelection, ROUTE_POLL_INTERVAL_MS);
+  const poll = setInterval(() => {
+    refreshPermissionMode();
+    syncSelection();
+  }, ROUTE_POLL_INTERVAL_MS);
   return () => {
     disposed = true;
     generation += 1;
@@ -474,6 +531,7 @@ function setup(api) {
     sessions.clear();
     ancestorSyncs.clear();
     executionChanges.clear();
+    permissionSyncs.clear();
     blockers.clear();
     blockerChanges.clear();
     expired.clear();

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 
 const requests: unknown[] = [];
 const activeDisposers: Array<() => void> = [];
@@ -11,6 +11,7 @@ let failConnections = false;
 const connections: Array<() => void> = [];
 const realNow = Date.now;
 const originalArgv = [...process.argv];
+let configDir: string;
 let clockOffset = 0;
 let clock: ReturnType<typeof spyOn>;
 
@@ -49,7 +50,9 @@ mock.module("node:net", () => ({
   },
 }));
 
-beforeEach(() => {
+beforeEach(async () => {
+  await mkdir(".local", { recursive: true });
+  configDir = await mkdtemp(".local/herdr-tui-config-");
   clockOffset = 0;
   clock = spyOn(Date, "now").mockImplementation(() => realNow() + clockOffset);
   process.argv = [...originalArgv];
@@ -62,17 +65,20 @@ beforeEach(() => {
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = "test.sock";
   process.env.HERDR_PANE_ID = "test:p1";
-  delete process.env.OPENCODE_CONFIG_DIR;
+  process.env.OPENCODE_CONFIG_DIR = configDir;
+  delete process.env.OPENCODE_CLI_CONFIG_CONTENT;
   delete process.env.HERDR_OPENCODE_TRACE;
 });
 
-afterEach(() => {
+afterEach(async () => {
   for (const dispose of activeDisposers.splice(0)) {
     dispose();
   }
   clock.mockRestore();
   process.argv = [...originalArgv];
   delete process.env.HERDR_OPENCODE_TRACE;
+  delete process.env.OPENCODE_CLI_CONFIG_CONTENT;
+  await rm(configDir, { recursive: true, force: true });
 });
 
 async function loadPlugin() {
@@ -478,6 +484,159 @@ test("regression: interrupted permission without permission.replied returns to i
   expect(tui.invalidated).toContain("a");
   expect(tui.synced).toContain("a");
   expect(tui.permissions.get("a")).toEqual([]);
+});
+
+test("regression: replied permissions stay expired through stale terminal sync and preserve idle hold", async () => {
+  for (const cacheDropsReply of [false, true]) {
+    for (const terminal of ["succeeded", "interrupted", "failed"]) {
+      const { tui, dispose } = await startV2();
+      tui.emit("session.execution.started", { sessionID: "a" });
+      tui.permissions.set("a", [{ id: "replied" }]);
+      tui.emit("permission.asked", { sessionID: "a", id: "replied" });
+      await flushReports();
+      if (cacheDropsReply) tui.permissions.set("a", []);
+      tui.emit("permission.replied", { sessionID: "a", requestID: "replied" });
+      await advance(100);
+      expect(states().at(-1)).toBe("working");
+      requests.length = 0;
+      let finishSync: () => void = () => {};
+      tui.api.data.session.permission.sync = async (id) => {
+        tui.synced.push(id);
+        await new Promise<void>((resolve) => { finishSync = resolve; });
+        tui.permissions.set(id, [{ id: "replied" }]);
+      };
+      tui.emit(`session.execution.${terminal}`, { sessionID: "a" });
+      await advance(100);
+      finishSync();
+      await flushReports();
+      expect(tui.permissions.get("a")).toEqual([{ id: "replied" }]);
+      expect(states()).not.toContain("blocked");
+      expect(states()).not.toContain("idle");
+      await advance(900);
+      expect(states()).not.toContain("idle");
+      await advance(700);
+      expect(states().at(-1)).toBe("idle");
+      expect(states()).not.toContain("blocked");
+      dispose();
+    }
+  }
+});
+
+test("regression: settle expires cache-only permission rows before blind sync replacement", async () => {
+  const { tui } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  // The pre-event reconciliation reads no rows; settle then sees a newly hydrated row.
+  let reads = 0;
+  tui.api.data.session.permission.list = (id) => id === "a" && ++reads > 1 ? [{ id: "cache-only" }] : [];
+  tui.serverPermissions.set("a", [{ id: "cache-only" }]);
+  requests.length = 0;
+  tui.emit("session.execution.succeeded", { sessionID: "a" });
+  await advance(100);
+  expect(states()).not.toContain("blocked");
+  expect(states()).not.toContain("idle");
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+});
+
+test("regression: earlier running sibling cannot prevent later execution delta reconciliation", async () => {
+  const tui = v2Api();
+  tui.sessions.set("later", { id: "later", parentID: "a" });
+  await startV2(tui);
+  tui.statuses.set("child", "running");
+  tui.emit("session.execution.started", { sessionID: "later" });
+  tui.statuses.set("later", "running");
+  await advance(100);
+  // Miss the later sibling's terminal event while the earlier sibling is active.
+  tui.statuses.set("later", "idle");
+  await advance(100);
+  tui.statuses.set("child", "idle");
+  await advance(100);
+  await advance(1_600);
+  expect(states().at(-1)).toBe("idle");
+});
+
+test("V2 follows live TUI autoaccept settings on and off without restarting", async () => {
+  const { tui } = await startV2();
+  await writeFile(`${configDir}/cli.json`, '{"session":{"permissions":"autoaccept"}}');
+  await advance(100);
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("permission.asked", { sessionID: "a", id: "auto" });
+  await flushReports();
+  expect(states().at(-1)).toBe("working");
+  await advance(100);
+  expect(states()).not.toContain("blocked");
+  await writeFile(`${configDir}/cli.json`, '{"session":{"permissions":"prompt"}}');
+  await advance(100);
+  expect(states().at(-1)).toBe("blocked");
+  tui.emit("permission.replied", { sessionID: "a", requestID: "auto" });
+  tui.emit("permission.asked", { sessionID: "a", id: "prompt" });
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
+});
+
+test("V2 recognizes all effective CLI auto aliases", async () => {
+  for (const flag of ["--auto", "--yolo", "--dangerously-skip-permissions"]) {
+    process.argv = [...originalArgv, flag];
+    const { tui, dispose } = await startV2();
+    requests.length = 0;
+    tui.emit("session.execution.started", { sessionID: "a" });
+    tui.emit("permission.asked", { sessionID: "a", id: "auto" });
+    await advance(100);
+    expect(states()).not.toContain("blocked");
+    await advance(500);
+    expect(states().at(-1)).toBe("blocked");
+    dispose();
+  }
+});
+
+test("V2 reads live JSONC settings and honors the inline config overlay", async () => {
+  await writeFile(`${configDir}/cli.json`, `{
+    // Keep quoted comment tokens and trailing commas inside strings intact.
+    "$schema": "https://opencode.ai/v2/cli.json",
+    "theme": {"name": "escaped\\\"// /* ,}",},
+    "session": {"permissions": "autoaccept",}, /* trailing comment */
+  }`);
+  const { tui, dispose } = await startV2();
+  tui.emit("session.execution.started", { sessionID: "a" });
+  tui.emit("permission.asked", { sessionID: "a", id: "jsonc" });
+  await flushReports();
+  expect(states().at(-1)).toBe("working");
+  dispose();
+  // Explicit inline prompt mode overrides autoaccept on disk.
+  process.env.OPENCODE_CLI_CONFIG_CONTENT = '{"session":{"permissions":"prompt"}}';
+  const overlay = await startV2();
+  overlay.tui.emit("permission.asked", { sessionID: "a", id: "prompt" });
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
+  overlay.dispose();
+  process.env.OPENCODE_CLI_CONFIG_CONTENT = '{"session":{"permissions":"autoaccept"}}';
+  await writeFile(`${configDir}/cli.json`, '{"session":{"permissions":"prompt"}}');
+  const inlineAuto = await startV2();
+  requests.length = 0;
+  inlineAuto.tui.emit("permission.asked", { sessionID: "a", id: "inline-auto" });
+  await advance(100);
+  expect(states()).not.toContain("blocked");
+});
+
+test("V2 config toggles cannot disable CLI-forced autoaccept in the current host", async () => {
+  process.argv.push("--yolo");
+  const { tui } = await startV2();
+  await writeFile(`${configDir}/cli.json`, '{"session":{"permissions":"prompt"}}');
+  await advance(100);
+  requests.length = 0;
+  tui.emit("permission.asked", { sessionID: "a", id: "forced" });
+  await advance(100);
+  expect(states()).not.toContain("blocked");
+  await advance(500);
+  expect(states().at(-1)).toBe("blocked");
+});
+
+test("V2 flags after the CLI argument terminator do not enable autoaccept", async () => {
+  process.argv.push("--", "--yolo");
+  const { tui } = await startV2();
+  tui.emit("permission.asked", { sessionID: "a", id: "prompt" });
+  await flushReports();
+  expect(states().at(-1)).toBe("blocked");
 });
 
 test("regression: child permission orphaned by parent interrupt returns to idle", async () => {
