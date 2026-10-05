@@ -273,7 +273,10 @@ pub(crate) fn spawn_and_wait_for_server(socket_path: &Path, timeout: Duration) -
         socket_path,
         &log_path,
         timeout,
-        || server_socket_ready(socket_path),
+        StartupReadiness {
+            client_ready: || server_socket_ready(socket_path),
+            api_listening: || crate::ipc::connect_local_stream(&crate::api::socket_path()).is_ok(),
+        },
         || {
             daemon
                 .try_wait()
@@ -291,11 +294,19 @@ fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Result<(
         socket_path,
         Path::new("test-server.log"),
         timeout,
-        || server_socket_ready(socket_path),
+        StartupReadiness {
+            client_ready: || server_socket_ready(socket_path),
+            api_listening: || false,
+        },
         || Ok(None),
         || started.elapsed(),
         std::thread::sleep,
     )
+}
+
+struct StartupReadiness<Ready, Listening> {
+    client_ready: Ready,
+    api_listening: Listening,
 }
 
 /// Shared local/remote readiness policy. Dependencies are injected so startup
@@ -304,32 +315,44 @@ fn wait_for_startup(
     socket_path: &Path,
     log_path: &Path,
     timeout: Duration,
-    mut ready: impl FnMut() -> io::Result<bool>,
+    mut readiness: StartupReadiness<impl FnMut() -> io::Result<bool>, impl FnMut() -> bool>,
     mut exit: impl FnMut() -> io::Result<Option<String>>,
     mut elapsed: impl FnMut() -> Duration,
     mut sleep: impl FnMut(Duration),
 ) -> io::Result<()> {
+    let mut observe_owned_child = true;
     loop {
-        if let Some(status) = exit().map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to observe server startup: {error}; check {}",
+        if let Some(status) = if observe_owned_child {
+            exit().map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to observe server startup: {error}; check {}",
+                        log_path.display()
+                    ),
+                )
+            })?
+        } else {
+            None
+        } {
+            // Concurrent launchers can lose the API bind before the winner's
+            // client socket is ready. Attach to that winner without spawning
+            // again or extending the original readiness deadline.
+            if (readiness.api_listening)() {
+                observe_owned_child = false;
+            } else {
+                return Err(io::Error::other(format!(
+                    "server exited before becoming ready ({status}; socket: {}); check {}",
+                    socket_path.display(),
                     log_path.display()
-                ),
-            )
-        })? {
-            return Err(io::Error::other(format!(
-                "server exited before becoming ready ({status}; socket: {}); check {}",
-                socket_path.display(),
-                log_path.display()
-            )));
+                )));
+            }
         }
         let waited = elapsed();
         if waited >= timeout {
             break;
         }
-        if ready()? {
+        if (readiness.client_ready)()? {
             info!(path = %socket_path.display(), "server socket ready");
             return Ok(());
         }
@@ -427,7 +450,10 @@ mod tests {
             Path::new("/lab/client.sock"),
             Path::new("/lab/named-session/herdr-server.log"),
             timeout,
-            || Ok(bind_at.is_some_and(|bind| elapsed.get() >= bind)),
+            StartupReadiness {
+                client_ready: || Ok(bind_at.is_some_and(|bind| elapsed.get() >= bind)),
+                api_listening: || false,
+            },
             || {
                 Ok(exit_at
                     .filter(|(at, _)| elapsed.get() >= *at)
@@ -437,6 +463,49 @@ mod tests {
             |delay| elapsed.set(elapsed.get() + delay),
         );
         (result, elapsed.get())
+    }
+
+    #[test]
+    fn owned_startup_concurrent_loser_waits_for_winning_server() {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let observations = std::cell::Cell::new(0);
+        let result = wait_for_startup(
+            Path::new("/lab/client.sock"),
+            Path::new("/lab/named-session/herdr-server.log"),
+            Duration::from_secs(5),
+            StartupReadiness {
+                client_ready: || Ok(elapsed.get() >= Duration::from_secs(1)),
+                api_listening: || true,
+            },
+            || {
+                observations.set(observations.get() + 1);
+                Ok(Some("exit status: 1 (AddrInUse)".to_owned()))
+            },
+            || elapsed.get(),
+            |delay| elapsed.set(elapsed.get() + delay),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(elapsed.get(), Duration::from_secs(1));
+        assert_eq!(observations.get(), 1);
+    }
+
+    #[test]
+    fn owned_startup_concurrent_winner_without_client_keeps_deadline() {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let result = wait_for_startup(
+            Path::new("/lab/client.sock"),
+            Path::new("/lab/named-session/herdr-server.log"),
+            Duration::from_secs(5),
+            StartupReadiness {
+                client_ready: || Ok(false),
+                api_listening: || true,
+            },
+            || Ok(Some("exit status: 1 (AddrInUse)".to_owned())),
+            || elapsed.get(),
+            |delay| elapsed.set(elapsed.get() + delay),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(elapsed.get(), Duration::from_secs(5));
     }
 
     #[test]
@@ -505,7 +574,10 @@ mod tests {
             Path::new("/lab/client.sock"),
             Path::new("/lab/session/herdr-server.log"),
             Duration::from_secs(15),
-            || panic!("observation failed before socket probe"),
+            StartupReadiness {
+                client_ready: || panic!("observation failed before socket probe"),
+                api_listening: || panic!("observation failed before API probe"),
+            },
             || {
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
