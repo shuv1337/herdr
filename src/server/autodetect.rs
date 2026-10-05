@@ -300,7 +300,7 @@ fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Result<(
 
 /// Shared local/remote readiness policy. Dependencies are injected so startup
 /// transitions can be tested without launching or contacting a Herdr session.
-pub(crate) fn wait_for_startup(
+fn wait_for_startup(
     socket_path: &Path,
     log_path: &Path,
     timeout: Duration,
