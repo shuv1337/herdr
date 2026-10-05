@@ -1,0 +1,32 @@
+# Trusted validation policy: takes effect after merging into the default branch.
+# Keep command selection on that trusted branch (never opt into branch commands).
+allow_repo_commands: false
+# Project instructions include live detection smoke tests for maintainers; gate
+# agents must not inherit that operator role or the captain's session context.
+disable_project_settings: true
+
+commands:
+  test: "just ci-tests"
+  lint: "just lint"
+
+# The agent timeout is a global-only setting, not a supported repository key.
+# Bound scope here to deterministic checks within the default 30-minute budget.
+test:
+  instructions: &validation_safety |
+    Validation is limited to deterministic, offline unit and contract checks.
+    Use just ci-tests for tests and just lint for lint. Do not run just check,
+    windows-lint, or just setup-windows-cross; do not accept the Windows SDK license.
+    Keep validation within the pipeline agent's 30-minute limit. If checks cannot
+    finish within that budget, report incomplete validation rather than expanding
+    scope or starting live smoke tests.
+    Never run herdr CLI or API commands against any live session or pane.
+    Never run herdr server commands. Never write or remove overrides under
+    ~/.config/herdr/agent-detection/. Never start a named Herdr session outside
+    a disposable throwaway; this pipeline must not start even a throwaway session.
+    Record agent-detection compatibility claims and missing live evidence for a
+    maintainer to validate separately; do not live-test them in the pipeline.
+
+review:
+  path_instructions:
+    - path: "**"
+      instructions: *validation_safety
