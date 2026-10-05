@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use super::socket_paths::client_socket_path;
 
@@ -188,7 +188,8 @@ fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<(
 ///
 /// The server process is fully detached:
 /// - Runs in its own session (setsid) so it survives the client exiting
-/// - Stdin/stdout/stderr are redirected to /dev/null; failures name the session log
+/// - Stdin/stdout are redirected to /dev/null; stderr appends to the session log
+///   when it can be opened and is otherwise discarded
 /// - Inherits relevant environment variables (`XDG_CONFIG_HOME`, `HERDR_SESSION`,
 ///   socket overrides, etc.), except inherited socket overrides are cleared when
 ///   this CLI invocation explicitly selected a session.
@@ -206,15 +207,7 @@ fn spawn_server_daemon() -> io::Result<crate::platform::ServerDaemon> {
 
     let mut command = build_server_daemon_command(exe);
     let log_path = crate::session::data_dir().join("herdr-server.log");
-    crate::platform::configure_server_daemon_stderr(&mut command, &log_path).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!(
-                "server was not started: cannot capture startup stderr in {}: {err}",
-                log_path.display()
-            ),
-        )
-    })?;
+    capture_server_daemon_stderr(&mut command, &log_path);
 
     let daemon =
         crate::platform::launch_server_daemon_command(&mut command).map_err(|err: io::Error| {
@@ -226,6 +219,16 @@ fn spawn_server_daemon() -> io::Result<crate::platform::ServerDaemon> {
     info!(pid = daemon.pid(), "server daemon spawned");
 
     Ok(daemon)
+}
+
+fn capture_server_daemon_stderr(command: &mut Command, log_path: &Path) {
+    if let Err(err) = crate::platform::configure_server_daemon_stderr(command, log_path) {
+        warn!(
+            log = %log_path.display(),
+            %err,
+            "cannot capture server startup stderr; discarding it"
+        );
+    }
 }
 
 fn build_server_daemon_command(exe: PathBuf) -> Command {
@@ -588,6 +591,40 @@ mod tests {
             std::fs::read_to_string(log_path).unwrap(),
             "new config startup\n"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_review_stderr_setup_failure_still_starts_daemon() {
+        let dir = unique_test_dir("startup-stderr-fallback");
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let log_path = blocker.join("herdr-server.log");
+        let marker = dir.join("daemon-started");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf started > \"$1\"; printf 'discarded\\n' >&2")
+            .arg("sh")
+            .arg(&marker)
+            .stderr(std::process::Stdio::null());
+        capture_server_daemon_stderr(&mut command, &log_path);
+        let mut daemon = crate::platform::launch_server_daemon_command(&mut command).unwrap();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = daemon.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "daemon never exited"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "{status}");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "started");
+        assert!(!log_path.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
