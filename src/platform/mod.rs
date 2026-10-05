@@ -181,10 +181,8 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
-#[cfg(not(windows))]
-pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
-    command.spawn().map(|child| child.id())
-}
+#[cfg(unix)]
+pub(crate) use unix_common::{launch_server_daemon_command, ServerDaemon};
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn prepare_server_process(_handoff_import: bool) -> std::io::Result<bool> {

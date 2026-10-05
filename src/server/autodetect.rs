@@ -185,13 +185,13 @@ fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<(
 ///
 /// The server process is fully detached:
 /// - Runs in its own session (setsid) so it survives the client exiting
-/// - Stdin/stdout/stderr are redirected to /dev/null
+/// - Stdin/stdout/stderr are redirected to /dev/null; failures name the session log
 /// - Inherits relevant environment variables (`XDG_CONFIG_HOME`, `HERDR_SESSION`,
 ///   socket overrides, etc.), except inherited socket overrides are cleared when
 ///   this CLI invocation explicitly selected a session.
 ///
-/// Returns the PID of the spawned server process.
-pub fn spawn_server_daemon() -> io::Result<u32> {
+/// Returns an owned startup receipt for observing an early exit.
+fn spawn_server_daemon() -> io::Result<crate::platform::ServerDaemon> {
     let exe = std::env::current_exe().map_err(|err| {
         io::Error::new(
             err.kind(),
@@ -203,13 +203,21 @@ pub fn spawn_server_daemon() -> io::Result<u32> {
 
     let mut command = build_server_daemon_command(exe);
 
-    let pid =
+    let daemon =
         crate::platform::launch_server_daemon_command(&mut command).map_err(|err: io::Error| {
-            io::Error::new(err.kind(), format!("failed to spawn herdr server: {err}"))
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to launch herdr server: {err}; check {}",
+                    crate::session::data_dir()
+                        .join("herdr-server.log")
+                        .display()
+                ),
+            )
         })?;
-    info!(pid, "server daemon spawned");
+    info!(pid = daemon.pid(), "server daemon spawned");
 
-    Ok(pid)
+    Ok(daemon)
 }
 
 fn build_server_daemon_command(exe: PathBuf) -> Command {
@@ -244,36 +252,94 @@ fn build_server_daemon_command(exe: PathBuf) -> Command {
 // Socket readiness
 // ---------------------------------------------------------------------------
 
-/// Waits for the server's client socket to become ready for connections.
-///
-/// Polls the socket path at regular intervals until a connection succeeds
-/// or the timeout elapses. Returns an error if the server doesn't become
-/// ready within the timeout.
-pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
+fn server_socket_ready(socket_path: &Path) -> io::Result<bool> {
+    #[cfg(windows)]
+    {
+        client_protocol_accepts_hello(socket_path)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(is_server_listening_at(socket_path))
+    }
+}
 
-    while std::time::Instant::now() < deadline {
-        #[cfg(windows)]
-        if client_protocol_accepts_hello(socket_path)? {
-            info!(path = %socket_path.display(), "server client protocol ready");
-            return Ok(());
+/// Launch exactly one owned daemon and wait for readiness or its early exit.
+/// A healthy process keeps its original deadline; timeout never kills or retries it.
+pub(crate) fn spawn_and_wait_for_server(socket_path: &Path, timeout: Duration) -> io::Result<()> {
+    let mut daemon = spawn_server_daemon()?;
+    let started = std::time::Instant::now();
+    let log_path = crate::session::data_dir().join("herdr-server.log");
+    wait_for_startup(
+        socket_path,
+        &log_path,
+        timeout,
+        || server_socket_ready(socket_path),
+        || {
+            daemon
+                .try_wait()
+                .map(|status| status.map(|status| status.to_string()))
+        },
+        || started.elapsed(),
+        std::thread::sleep,
+    )
+}
+
+#[cfg(test)]
+fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Result<()> {
+    let started = std::time::Instant::now();
+    wait_for_startup(
+        socket_path,
+        Path::new("test-server.log"),
+        timeout,
+        || server_socket_ready(socket_path),
+        || Ok(None),
+        || started.elapsed(),
+        std::thread::sleep,
+    )
+}
+
+/// Shared local/remote readiness policy. Dependencies are injected so startup
+/// transitions can be tested without launching or contacting a Herdr session.
+pub(crate) fn wait_for_startup(
+    socket_path: &Path,
+    log_path: &Path,
+    timeout: Duration,
+    mut ready: impl FnMut() -> io::Result<bool>,
+    mut exit: impl FnMut() -> io::Result<Option<String>>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> io::Result<()> {
+    loop {
+        if let Some(status) = exit().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to observe server startup: {error}; check {}",
+                    log_path.display()
+                ),
+            )
+        })? {
+            return Err(io::Error::other(format!(
+                "server exited before becoming ready ({status}; socket: {}); check {}",
+                socket_path.display(),
+                log_path.display()
+            )));
         }
-
-        #[cfg(not(windows))]
-        if is_server_listening_at(socket_path) {
+        let waited = elapsed();
+        if waited >= timeout {
+            break;
+        }
+        if ready()? {
             info!(path = %socket_path.display(), "server socket ready");
             return Ok(());
         }
-        std::thread::sleep(SOCKET_POLL_INTERVAL);
+        sleep(SOCKET_POLL_INTERVAL.min(timeout - waited));
     }
-
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
         format!(
-            "server did not become ready within {}s (socket: {}). The background server may still be starting; try `herdr` again, or check {}",
-            timeout.as_secs(),
-            socket_path.display(),
-            crate::session::data_dir().join("herdr-server.log").display()
+            "server did not become ready within {}s (socket: {}). The background server may still be starting; check {}",
+            timeout.as_secs(), socket_path.display(), log_path.display()
         ),
     ))
 }
@@ -313,8 +379,7 @@ pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
         }
     } else {
         info!("no server running, spawning server daemon");
-        spawn_server_daemon()
-            .and_then(|_| wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT))
+        spawn_and_wait_for_server(&socket_path, SERVER_READY_TIMEOUT)
     };
     if let Err(error) = startup {
         if !saved_federation {
@@ -350,6 +415,110 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::path::PathBuf::from(format!("/tmp/ha-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn fake_startup(
+        bind_at: Option<Duration>,
+        exit_at: Option<(Duration, &str)>,
+        timeout: Duration,
+    ) -> (io::Result<()>, Duration) {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let result = wait_for_startup(
+            Path::new("/lab/client.sock"),
+            Path::new("/lab/named-session/herdr-server.log"),
+            timeout,
+            || Ok(bind_at.is_some_and(|bind| elapsed.get() >= bind)),
+            || {
+                Ok(exit_at
+                    .filter(|(at, _)| elapsed.get() >= *at)
+                    .map(|(_, status)| status.to_owned()))
+            },
+            || elapsed.get(),
+            |delay| elapsed.set(elapsed.get() + delay),
+        );
+        (result, elapsed.get())
+    }
+
+    #[test]
+    fn owned_startup_reports_exit_before_bind_without_waiting_for_deadline() {
+        let (result, elapsed) = fake_startup(
+            None,
+            Some((Duration::ZERO, "exit status: 23")),
+            Duration::from_secs(15),
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("exit status: 23"));
+        assert!(error
+            .to_string()
+            .contains("/lab/named-session/herdr-server.log"));
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn owned_startup_allows_slow_healthy_bind() {
+        let (result, elapsed) =
+            fake_startup(Some(Duration::from_secs(14)), None, Duration::from_secs(15));
+        assert!(result.is_ok());
+        assert_eq!(elapsed, Duration::from_secs(14));
+    }
+
+    #[test]
+    fn owned_startup_healthy_timeout_preserves_deadline_and_diagnostics() {
+        let (result, elapsed) = fake_startup(None, None, Duration::from_secs(15));
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("may still be starting"));
+        assert!(error
+            .to_string()
+            .contains("/lab/named-session/herdr-server.log"));
+        assert_eq!(elapsed, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn remote_startup_deadline_reports_early_signal() {
+        let (result, elapsed) = fake_startup(
+            None,
+            Some((Duration::from_millis(100), "signal: 9 (SIGKILL)")),
+            Duration::from_secs(5),
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("signal: 9"));
+        assert_eq!(elapsed, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn owned_startup_checks_exit_at_deadline_instead_of_misreporting_timeout() {
+        let (result, elapsed) = fake_startup(
+            None,
+            Some((Duration::from_secs(15), "exit status: 1")),
+            Duration::from_secs(15),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(elapsed, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn owned_startup_observation_failure_names_the_session_log() {
+        let error = wait_for_startup(
+            Path::new("/lab/client.sock"),
+            Path::new("/lab/session/herdr-server.log"),
+            Duration::from_secs(15),
+            || panic!("observation failed before socket probe"),
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot query child",
+                ))
+            },
+            || Duration::ZERO,
+            |_| panic!("observation failure must not wait"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("cannot query child"));
+        assert!(error.to_string().contains("/lab/session/herdr-server.log"));
     }
 
     #[test]

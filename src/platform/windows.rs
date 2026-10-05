@@ -1196,11 +1196,74 @@ pub(crate) fn configure_background_command_platform(command: &mut std::process::
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
-pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
+/// WMI launches outside a kill-on-close job; retain a process handle rather than
+/// trying to infer liveness later from a PID that Windows may reuse.
+pub(crate) enum ServerDaemon {
+    Child(std::process::Child),
+    Wmi { pid: u32, handle: OwnedHandle },
+}
+
+impl ServerDaemon {
+    pub(crate) fn pid(&self) -> u32 {
+        match self {
+            Self::Child(child) => child.id(),
+            Self::Wmi { pid, .. } => *pid,
+        }
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::windows::process::ExitStatusExt;
+        use windows_sys::Win32::{
+            Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::WaitForSingleObject,
+        };
+        match self {
+            Self::Child(child) => child.try_wait(),
+            Self::Wmi { handle, .. } => {
+                // SAFETY: the owned process handle stays valid for both calls.
+                match unsafe { WaitForSingleObject(handle.as_raw_handle().cast(), 0) } {
+                    WAIT_TIMEOUT => Ok(None),
+                    WAIT_OBJECT_0 => {
+                        let mut code = 0;
+                        if unsafe { GetExitCodeProcess(handle.as_raw_handle().cast(), &mut code) }
+                            == 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(Some(std::process::ExitStatus::from_raw(code)))
+                    }
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn launch_server_daemon_command(
+    command: &mut std::process::Command,
+) -> std::io::Result<ServerDaemon> {
     if current_job_kills_processes_on_close()? {
-        launch_server_daemon_with_wmi(command)
+        use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+        let pid = launch_server_daemon_with_wmi(command)?;
+        // SAFETY: opens only the process just created by WMI, with query/wait rights.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::other(format!(
+                "cannot observe WMI server process {pid} (it may have exited before its handle was opened; exit status unavailable): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: OpenProcess returned a new valid handle owned by this receipt.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+        Ok(ServerDaemon::Wmi { pid, handle })
     } else {
-        command.spawn().map(|child| child.id())
+        command.spawn().map(ServerDaemon::Child)
     }
 }
 

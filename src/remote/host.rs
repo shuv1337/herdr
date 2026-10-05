@@ -58,6 +58,78 @@ fn ensure_remote_server_running() -> io::Result<()> {
         ));
     }
 
-    crate::server::autodetect::spawn_server_daemon()?;
-    crate::server::autodetect::wait_for_server_socket(&socket_path, Duration::from_secs(5))
+    start_remote_server(
+        &socket_path,
+        crate::server::autodetect::spawn_and_wait_for_server,
+    )
+}
+
+// Keep existing-server validation unchanged. Only the absent-server launch is
+// injected, so local and remote owned startup share the same exit diagnostics.
+fn start_remote_server(
+    socket_path: &std::path::Path,
+    start: impl FnOnce(&std::path::Path, Duration) -> io::Result<()>,
+) -> io::Result<()> {
+    start(socket_path, Duration::from_secs(5))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_owned_startup_propagates_exit_and_uses_five_second_deadline() {
+        let error = start_remote_server(
+            std::path::Path::new("/remote/client.sock"),
+            |socket, timeout| {
+                assert_eq!(timeout, Duration::from_secs(5));
+                crate::server::autodetect::wait_for_startup(
+                    socket,
+                    std::path::Path::new("/remote/session/herdr-server.log"),
+                    timeout,
+                    || Ok(false),
+                    || Ok(Some("exit status: 23".to_owned())),
+                    || Duration::ZERO,
+                    |_| panic!("dead startup must not wait"),
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("exit status: 23"));
+        assert!(error
+            .to_string()
+            .contains("/remote/session/herdr-server.log"));
+    }
+
+    #[test]
+    fn remote_owned_startup_allows_slow_bind_and_reports_healthy_timeout() {
+        for bind_at in [Some(Duration::from_secs(4)), None] {
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let result = start_remote_server(
+                std::path::Path::new("/remote/client.sock"),
+                |socket, timeout| {
+                    crate::server::autodetect::wait_for_startup(
+                        socket,
+                        std::path::Path::new("/remote/session/herdr-server.log"),
+                        timeout,
+                        || Ok(bind_at.is_some_and(|bind| elapsed.get() >= bind)),
+                        || Ok(None),
+                        || elapsed.get(),
+                        |delay| elapsed.set(elapsed.get() + delay),
+                    )
+                },
+            );
+            if let Some(bind_at) = bind_at {
+                assert!(result.is_ok());
+                assert_eq!(elapsed.get(), bind_at);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert!(error.to_string().contains("within 5s"));
+                assert!(error.to_string().contains("may still be starting"));
+                assert_eq!(elapsed.get(), Duration::from_secs(5));
+            }
+        }
+    }
 }
