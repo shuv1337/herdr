@@ -287,7 +287,7 @@ pub(crate) fn spawn_and_wait_for_server(socket_path: &Path, timeout: Duration) -
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Result<()> {
     let started = std::time::Instant::now();
     wait_for_startup(
