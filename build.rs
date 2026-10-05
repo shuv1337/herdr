@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 #[path = "src/build_commit_select.rs"]
@@ -76,77 +76,6 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
-fn emit_build_commit(manifest_dir: &Path) {
-    if env::var("HERDR_BUILD_COMMIT").map(|v| !v.trim().is_empty()) == Ok(true) {
-        return;
-    }
-
-    let git_dir = manifest_dir.join(".git");
-    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        git_dir.join("refs/heads").display()
-    );
-
-    // Colocated jj sets Git HEAD to the parent of `@`. An empty child leaves
-    // HEAD on the bookmarked commit. `jj edit` of that bookmark makes `@` the
-    // commit itself, so HEAD is the parent and would be recorded instead.
-    let Some(git_head) = git_rev_parse(manifest_dir, &["HEAD"]) else {
-        return;
-    };
-    let working_copy = jj_working_copy(manifest_dir);
-    let selected = build_commit_select::select_build_commit(&git_head, working_copy.as_ref());
-    let commit = git_rev_parse(manifest_dir, &["--short=12", selected])
-        .or_else(|| git_rev_parse(manifest_dir, &["--short=12", "HEAD"]));
-    if let Some(commit) = commit {
-        println!("cargo:rustc-env=HERDR_BUILD_COMMIT={commit}");
-    }
-}
-
-fn git_rev_parse(manifest_dir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .args(args)
-        .current_dir(manifest_dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
-}
-
-fn jj_working_copy(manifest_dir: &Path) -> Option<build_commit_select::JjWorkingCopy> {
-    if !manifest_dir.join(".jj").is_dir() {
-        return None;
-    }
-    let output = Command::new("jj")
-        .args([
-            "log",
-            "-r",
-            "@",
-            "--ignore-working-copy",
-            "--color=never",
-            "--no-graph",
-            "-T",
-            build_commit_select::JJ_WORKING_COPY_TEMPLATE,
-        ])
-        .current_dir(manifest_dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    build_commit_select::parse_jj_working_copy(&stdout)
-}
-
 fn validate_fork_revision() {
     let Ok(revision) = env::var("HERDR_FORK_REVISION") else {
         return;
@@ -185,7 +114,7 @@ fn main() {
     );
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    emit_build_commit(&manifest_dir);
+    build_commit_select::emit_build_commit(&manifest_dir, std::ffi::OsStr::new("jj"));
     let vendored_dir = manifest_dir.join("vendor/libghostty-vt");
     let optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());
     let simd = env_bool("LIBGHOSTTY_VT_SIMD").unwrap_or(true);
