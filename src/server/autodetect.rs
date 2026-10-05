@@ -320,9 +320,9 @@ fn wait_for_startup(
     mut elapsed: impl FnMut() -> Duration,
     mut sleep: impl FnMut(Duration),
 ) -> io::Result<()> {
-    let mut observe_owned_child = true;
+    let mut owned_exit = None;
     loop {
-        if let Some(status) = if observe_owned_child {
+        if let Some(status) = if owned_exit.is_none() {
             exit().map_err(|error| {
                 io::Error::new(
                     error.kind(),
@@ -339,7 +339,7 @@ fn wait_for_startup(
             // client socket is ready. Attach to that winner without spawning
             // again or extending the original readiness deadline.
             if (readiness.api_listening)() {
-                observe_owned_child = false;
+                owned_exit = Some(status);
             } else {
                 return Err(io::Error::other(format!(
                     "server exited before becoming ready ({status}; socket: {}); check {}",
@@ -358,11 +358,19 @@ fn wait_for_startup(
         }
         sleep(SOCKET_POLL_INTERVAL.min(timeout - waited));
     }
+    let detail = match owned_exit {
+        Some(status) => format!(
+            "the launched server exited ({status}) and the existing server never accepted clients"
+        ),
+        None => "The background server may still be starting".to_owned(),
+    };
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
         format!(
-            "server did not become ready within {}s (socket: {}). The background server may still be starting; check {}",
-            timeout.as_secs(), socket_path.display(), log_path.display()
+            "server did not become ready within {}s (socket: {}). {detail}; check {}",
+            timeout.as_secs(),
+            socket_path.display(),
+            log_path.display()
         ),
     ))
 }
@@ -504,7 +512,12 @@ mod tests {
             || elapsed.get(),
             |delay| elapsed.set(elapsed.get() + delay),
         );
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("exit status: 1 (AddrInUse)"));
+        assert!(error
+            .to_string()
+            .contains("/lab/named-session/herdr-server.log"));
         assert_eq!(elapsed.get(), Duration::from_secs(5));
     }
 
