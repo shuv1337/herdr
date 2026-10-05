@@ -239,7 +239,7 @@ herdr integration install opencode
 
 安装会把 V1 TUI 插件登记到 `tui.jsonc`，把 V2 TUI 插件登记到 `cli.json`，并保留其他偏好和插件。若 `tui.json` 里已有 V1 登记，则视为已安装，不再创建 `tui.jsonc`。卸载只从这两个 TUI 配置文件中移除 Herdr 登记，文件及其他偏好会保留。如果宿主仍有待导入的 V1 TUI 偏好（`tui.json` 或 `kv.json`），Herdr 会推迟写入 `cli.json`，以便首次启动迁移能够运行；请先启动一次 V2 客户端，再重新安装该集成。否则 Herdr 会创建 `cli.json` 并写入插件登记。安装后请重启 TUI。卸载会删除受管插件文件及其配置条目。重新安装还会删除旧的 fork 插件包 `plugins/herdr-agent-state/`，以免与上游形状的插件一并加载。
 
-V2 生命周期上报运行在窗格本地 TUI 中，即使多个窗格共享同一服务器，也会关联到当前选中的根会话。完成和中断会清除 working；未处理的 permission、表单以及失败的执行会保持 blocked。V2 Mini 和无头客户端不运行 TUI 插件，因此不会提供这种生命周期上报。
+V2 生命周期上报运行在窗格本地 TUI 中，即使多个窗格共享同一服务器，也会关联到当前选中的根会话。只要后代会话仍在运行，窗格就保持 working，并在回到 idle 前短暂等待。完成和中断会使该次执行的未处理 permission 失效，包括过期刷新结果返回的已回复请求；仍有效的 permission 请求和待处理表单会使窗格保持 blocked。根会话执行失败后，整个会话族结束运行时回到 idle，并显示 `failed` 状态标签，直到下一次根会话执行开始。根会话路由上的 autoaccept permission 短暂闪烁会延迟上报，但 prompt 模式请求、表单和子会话路由上的停滞仍会立即显示。由于插件 API 未公开 permission 模式和 CLI 参数，集成会轮询 `cli.json` 中的实时 `session.permissions` 设置，并遵循 `OPENCODE_CLI_CONFIG_CONTENT`、`--auto`、`--yolo` 和 `--dangerously-skip-permissions`。当前 TUI 中 CLI auto 标志优先于设置。单独的应用设置 `permissions.autoApprove` 未向 TUI 插件公开。将 `HERDR_OPENCODE_TRACE` 设为文件路径可启用上报诊断（事件原因、会话 ID、阻塞项键和状态，不含提示内容）。V2 Mini 和无头客户端不运行 TUI 插件，因此不会提供这种生命周期上报。
 
 该插件会在任一宿主运行于 Herdr 窗格内时上报生命周期状态和会话身份。标准 OpenCode 仍识别为 `opencode`，并通过 `opencode --session <id>` 恢复；ShuvCode 识别为 `shuvcode`，并通过 `shuvcode --session <id>` 恢复。两种身份共享 OpenCode 的检测行为以及 `ui.sidebar.agents.rows_by_agent.opencode` / `ui.sound.agents.open_code` 设置。插件未安装时，屏幕清单检测仍然可用。
 

@@ -1,5 +1,17 @@
 use super::*;
 
+fn assert_takeover_shutdown(receiver: &std::sync::mpsc::Receiver<Vec<u8>>) {
+    // The test client writer forwards queued control messages on a drain thread.
+    // Handling the takeover synchronously does not imply delivery has completed.
+    let message = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("direct controller should receive takeover shutdown");
+    assert_eq!(
+        read_server_shutdown_reason(message),
+        Some("terminal attach taken over".into())
+    );
+}
+
 fn with_controlled_pane(
     test: impl FnOnce(
         &mut HeadlessServer,
@@ -146,10 +158,7 @@ fn shell_activity_takes_over_direct_control_and_restores_geometry() {
                         .is_ok());
                     }
                 }
-                assert_eq!(
-                    read_server_shutdown_reason(controller.try_recv().unwrap()),
-                    Some("terminal attach taken over".into())
-                );
+                assert_takeover_shutdown(&controller);
                 assert!(!server.clients.contains_key(&2));
                 assert!(!server
                     .terminal_attach_owners
@@ -190,10 +199,7 @@ fn shell_activity_takes_over_direct_control_and_restores_geometry() {
                         takeover: true,
                     })
                 );
-                assert_eq!(
-                    read_server_shutdown_reason(phone.try_recv().unwrap()),
-                    Some("terminal attach taken over".into())
-                );
+                assert_takeover_shutdown(&phone);
                 // A late disconnect from the old phone must not remove the new owner.
                 server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 4 });
                 assert_eq!(
@@ -298,10 +304,7 @@ fn focus_baselines_and_repeated_true_do_not_reclaim() {
             client_id: 1,
             focused: true,
         });
-        assert_eq!(
-            read_server_shutdown_reason(controller.try_recv().unwrap()),
-            Some("terminal attach taken over".into())
-        );
+        assert_takeover_shutdown(&controller);
     });
 }
 
@@ -352,10 +355,7 @@ fn hover_scroll_and_release_preserve_control_but_key_press_reclaims() {
             pane_id,
             events: vec![pane_key(protocol::ClientKeyKind::Press)],
         });
-        assert_eq!(
-            read_server_shutdown_reason(controller.try_recv().unwrap()),
-            Some("terminal attach taken over".into())
-        );
+        assert_takeover_shutdown(&controller);
     });
 }
 
@@ -425,10 +425,7 @@ fn popup_input_and_image_paste_reclaim_direct_control() {
                     events: vec![protocol::ClientPaneInputEvent::TextCommit("p".into())],
                 });
             }
-            assert_eq!(
-                read_server_shutdown_reason(controller.try_recv().unwrap()),
-                Some("terminal attach taken over".into())
-            );
+            assert_takeover_shutdown(&controller);
             assert!(!server
                 .app
                 .state
@@ -466,10 +463,7 @@ fn reclaim_claims_geometry_with_multiple_shell_clients() {
                 pane_id,
                 events: vec![protocol::ClientPaneInputEvent::TextCommit("x".into())],
             });
-            assert_eq!(
-                read_server_shutdown_reason(controller.try_recv().unwrap()),
-                Some("terminal attach taken over".into())
-            );
+            assert_takeover_shutdown(&controller);
             assert_eq!(
                 server
                     .app
@@ -630,10 +624,7 @@ fn shell_image_paste_reclaims_direct_control() {
                 protocol::ClientClipboardImageTarget::Pane(pane_id),
                 "/tmp/test-image.png".into(),
             ));
-            assert_eq!(
-                read_server_shutdown_reason(controller.try_recv().unwrap()),
-                Some("terminal attach taken over".into())
-            );
+            assert_takeover_shutdown(&controller);
             assert!(!server
                 .app
                 .state

@@ -95,7 +95,7 @@ class ForkManifestTests(unittest.TestCase):
             fork_release.build_manifest("0.9.1-shuv.1", "notes", assets, checksums, 22, 1)
 
 
-
+@unittest.skipUnless(os.name == "posix", "Discord release notifier requires a POSIX bash")
 class DiscordNotifyTests(unittest.TestCase):
     def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = {key: value for key, value in os.environ.items() if key != "DISCORD_RELEASE_WEBHOOK_URL"}
