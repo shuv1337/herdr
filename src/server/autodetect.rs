@@ -22,6 +22,9 @@ const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Poll interval when waiting for the server socket to appear.
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Bound peer identification by both this limit and the remaining startup deadline.
+const STARTUP_PEER_STATUS_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Timeout for checking the stable JSON API before attaching to the binary protocol socket.
 const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -202,17 +205,22 @@ fn spawn_server_daemon() -> io::Result<crate::platform::ServerDaemon> {
     info!(exe = %exe.display(), "spawning server daemon");
 
     let mut command = build_server_daemon_command(exe);
+    let log_path = crate::session::data_dir().join("herdr-server.log");
+    crate::platform::configure_server_daemon_stderr(&mut command, &log_path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "server was not started: cannot capture startup stderr in {}: {err}",
+                log_path.display()
+            ),
+        )
+    })?;
 
     let daemon =
         crate::platform::launch_server_daemon_command(&mut command).map_err(|err: io::Error| {
             io::Error::new(
                 err.kind(),
-                format!(
-                    "failed to launch herdr server: {err}; check {}",
-                    crate::session::data_dir()
-                        .join("herdr-server.log")
-                        .display()
-                ),
+                format!("failed to launch or observe herdr server: {err}"),
             )
         })?;
     info!(pid = daemon.pid(), "server daemon spawned");
@@ -224,7 +232,7 @@ fn build_server_daemon_command(exe: PathBuf) -> Command {
     let mut command = Command::new(&exe);
     command
         .arg("server")
-        // Redirect stdio to /dev/null
+        // Stderr is configured to append to the session log before launch.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -252,6 +260,16 @@ fn build_server_daemon_command(exe: PathBuf) -> Command {
 // Socket readiness
 // ---------------------------------------------------------------------------
 
+fn startup_peer_is_herdr_at(api_socket: &Path, timeout: Duration) -> bool {
+    if timeout.is_zero() {
+        return false;
+    }
+    matches!(
+        crate::api::read_runtime_status_at(api_socket, timeout),
+        Ok(Some(_))
+    )
+}
+
 fn server_socket_ready(socket_path: &Path) -> io::Result<bool> {
     #[cfg(windows)]
     {
@@ -275,7 +293,12 @@ pub(crate) fn spawn_and_wait_for_server(socket_path: &Path, timeout: Duration) -
         timeout,
         StartupReadiness {
             client_ready: || server_socket_ready(socket_path),
-            api_listening: || crate::ipc::connect_local_stream(&crate::api::socket_path()).is_ok(),
+            api_listening: |remaining: Duration| {
+                startup_peer_is_herdr_at(
+                    &crate::api::socket_path(),
+                    remaining.min(STARTUP_PEER_STATUS_TIMEOUT),
+                )
+            },
         },
         || {
             daemon
@@ -296,7 +319,7 @@ fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Result<(
         timeout,
         StartupReadiness {
             client_ready: || server_socket_ready(socket_path),
-            api_listening: || false,
+            api_listening: |_| false,
         },
         || Ok(None),
         || started.elapsed(),
@@ -315,7 +338,7 @@ fn wait_for_startup(
     socket_path: &Path,
     log_path: &Path,
     timeout: Duration,
-    mut readiness: StartupReadiness<impl FnMut() -> io::Result<bool>, impl FnMut() -> bool>,
+    mut readiness: StartupReadiness<impl FnMut() -> io::Result<bool>, impl FnMut(Duration) -> bool>,
     mut exit: impl FnMut() -> io::Result<Option<String>>,
     mut elapsed: impl FnMut() -> Duration,
     mut sleep: impl FnMut(Duration),
@@ -338,7 +361,7 @@ fn wait_for_startup(
             // Concurrent launchers can lose the API bind before the winner's
             // client socket is ready. Attach to that winner without spawning
             // again or extending the original readiness deadline.
-            if (readiness.api_listening)() {
+            if (readiness.api_listening)(timeout.saturating_sub(elapsed())) {
                 owned_exit = Some(status);
             } else {
                 return Err(io::Error::other(format!(
@@ -460,7 +483,7 @@ mod tests {
             timeout,
             StartupReadiness {
                 client_ready: || Ok(bind_at.is_some_and(|bind| elapsed.get() >= bind)),
-                api_listening: || false,
+                api_listening: |_| false,
             },
             || {
                 Ok(exit_at
@@ -474,6 +497,114 @@ mod tests {
     }
 
     #[test]
+    fn startup_review_foreign_api_listener_does_not_hide_owned_exit() {
+        let dir = unique_test_dir("foreign-startup-peer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let api_socket = dir.join("api.sock");
+        let listener = UnixListener::bind(&api_socket).unwrap();
+        let foreign = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            stream.write_all(b"foreign service\n").unwrap();
+        });
+        let result = wait_for_startup(
+            &dir.join("client.sock"),
+            &dir.join("herdr-server.log"),
+            Duration::from_secs(5),
+            StartupReadiness {
+                client_ready: || panic!("a foreign API listener must not trigger client waiting"),
+                api_listening: |remaining: Duration| {
+                    startup_peer_is_herdr_at(
+                        &api_socket,
+                        remaining.min(STARTUP_PEER_STATUS_TIMEOUT),
+                    )
+                },
+            },
+            || Ok(Some("exit status: 1".to_owned())),
+            || Duration::ZERO,
+            |_| panic!("a foreign API listener must not defer the exit"),
+        );
+        foreign.join().unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("exit status: 1"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_review_stderr_appends_exit_cause_to_existing_log() {
+        let dir = unique_test_dir("startup-stderr");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("herdr-server.log");
+        std::fs::write(&log_path, "previous log entry\n").unwrap();
+        // A fake daemon exercises the real receipt and stderr setup without
+        // invoking Herdr or contacting any session.
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf 'startup bind failed\\n' >&2; exit 23");
+        crate::platform::configure_server_daemon_stderr(&mut command, &log_path).unwrap();
+        let mut daemon = crate::platform::launch_server_daemon_command(&mut command).unwrap();
+        let started = std::time::Instant::now();
+        let result = wait_for_startup(
+            &dir.join("client.sock"),
+            &log_path,
+            Duration::from_secs(5),
+            StartupReadiness {
+                client_ready: || Ok(false),
+                api_listening: |_| false,
+            },
+            || {
+                daemon
+                    .try_wait()
+                    .map(|status| status.map(|status| status.to_string()))
+            },
+            || started.elapsed(),
+            std::thread::sleep,
+        );
+        assert!(result.unwrap_err().to_string().contains("exit status: 23"));
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            "previous log entry\nstartup bind failed\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_review_stderr_creates_missing_config_directory() {
+        let dir = unique_test_dir("missing-startup-config");
+        let log_path = dir.join("config/herdr-dev/herdr-server.log");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("printf 'new config startup\\n' >&2");
+        crate::platform::configure_server_daemon_stderr(&mut command, &log_path).unwrap();
+        assert!(command.status().unwrap().success());
+        assert_eq!(
+            std::fs::read_to_string(log_path).unwrap(),
+            "new config startup\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_review_spawn_failure_says_process_was_not_started() {
+        let dir = unique_test_dir("missing-startup-executable");
+        let mut command = Command::new(dir.join("missing-herdr"));
+        let error = match crate::platform::launch_server_daemon_command(&mut command) {
+            Ok(_) => panic!("missing executable cannot start"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("server process was not started"));
+        assert!(!error.to_string().contains("check"));
+    }
+
+    #[test]
     fn owned_startup_concurrent_loser_waits_for_winning_server() {
         let elapsed = std::cell::Cell::new(Duration::ZERO);
         let observations = std::cell::Cell::new(0);
@@ -483,7 +614,7 @@ mod tests {
             Duration::from_secs(5),
             StartupReadiness {
                 client_ready: || Ok(elapsed.get() >= Duration::from_secs(1)),
-                api_listening: || true,
+                api_listening: |_| true,
             },
             || {
                 observations.set(observations.get() + 1);
@@ -506,7 +637,7 @@ mod tests {
             Duration::from_secs(5),
             StartupReadiness {
                 client_ready: || Ok(false),
-                api_listening: || true,
+                api_listening: |_| true,
             },
             || Ok(Some("exit status: 1 (AddrInUse)".to_owned())),
             || elapsed.get(),
@@ -589,7 +720,7 @@ mod tests {
             Duration::from_secs(15),
             StartupReadiness {
                 client_ready: || panic!("observation failed before socket probe"),
-                api_listening: || panic!("observation failed before API probe"),
+                api_listening: |_| panic!("observation failed before API probe"),
             },
             || {
                 Err(io::Error::new(

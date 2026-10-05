@@ -184,8 +184,40 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
 #[cfg(unix)]
 pub(crate) use unix_common::{launch_server_daemon_command, ServerDaemon};
 
+fn daemon_spawn_error(error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("server process was not started: {error}"),
+    )
+}
+
+/// Capture daemon startup errors without truncating the session's server log.
+pub(crate) fn configure_server_daemon_stderr(
+    command: &mut std::process::Command,
+    log_path: &std::path::Path,
+) -> std::io::Result<()> {
+    if let Some(parent) = log_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    command.stderr(log);
+    // WMI creates the process independently and cannot inherit Command's stdio.
+    // The server must reopen its own stderr before any startup diagnostics.
+    #[cfg(windows)]
+    command.env(windows::SERVER_STARTUP_STDERR_ENV_VAR, log_path);
+    Ok(())
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn prepare_server_process(_handoff_import: bool) -> std::io::Result<bool> {
+    #[cfg(windows)]
+    windows::capture_server_startup_stderr()?;
     Ok(false)
 }
 

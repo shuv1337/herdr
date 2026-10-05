@@ -273,7 +273,10 @@ mod daemon {
     pub(crate) fn launch_server_daemon_command(
         command: &mut std::process::Command,
     ) -> std::io::Result<ServerDaemon> {
-        command.spawn().map(ServerDaemon)
+        command
+            .spawn()
+            .map(ServerDaemon)
+            .map_err(super::super::daemon_spawn_error)
     }
 }
 #[cfg(not(unix))]

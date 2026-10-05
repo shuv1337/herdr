@@ -16,6 +16,32 @@ use std::{
 mod clipboard_image;
 mod config_backup;
 
+pub(super) const SERVER_STARTUP_STDERR_ENV_VAR: &str = "HERDR_STARTUP_STDERR_LOG";
+
+pub(super) fn capture_server_startup_stderr() -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
+    let Some(path) = std::env::var_os(SERVER_STARTUP_STDERR_ENV_VAR) else {
+        return Ok(());
+    };
+    // This hint is for the daemon alone, not the panes it later starts.
+    std::env::remove_var(SERVER_STARTUP_STDERR_ENV_VAR);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    // SetStdHandle borrows the handle; retain the file for the process lifetime.
+    static STDERR_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+    let mut retained = STDERR_LOG
+        .lock()
+        .map_err(|_| std::io::Error::other("server startup stderr lock poisoned"))?;
+    // SAFETY: the open file handle is valid and kept alive after installation.
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, log.as_raw_handle().cast()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    *retained = Some(log);
+    Ok(())
+}
+
 pub(crate) fn windows_virtual_terminal_input_active() -> bool {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
@@ -1263,7 +1289,10 @@ pub(crate) fn launch_server_daemon_command(
         let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
         Ok(ServerDaemon::Wmi { pid, handle })
     } else {
-        command.spawn().map(ServerDaemon::Child)
+        command
+            .spawn()
+            .map(ServerDaemon::Child)
+            .map_err(super::daemon_spawn_error)
     }
 }
 
