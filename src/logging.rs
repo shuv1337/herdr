@@ -509,11 +509,9 @@ impl RotatingFileState {
     fn rotate_files(&mut self) -> io::Result<()> {
         self.file.take();
         if self.retained_files == 0 {
-            match fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
+            // Preserve the inode so independently held append handles (such as
+            // daemon startup stderr) continue writing into the visible log.
+            let _truncated = File::create(&self.path)?;
             self.current_size = 0;
             return Ok(());
         }
@@ -610,6 +608,29 @@ mod tests {
         assert!(!path.exists());
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn write_keeps_independent_append_handle_visible_after_rotation() {
+        let path = temp_log_path("startup-stderr-rotation");
+        let dir = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"12345678").unwrap();
+        // The launcher opens stderr before the daemon initializes tracing.
+        let mut startup_stderr = OpenOptions::new().append(true).open(&path).unwrap();
+        let writer = RotatingFileMakeWriter::new(dir.clone(), "herdr.log", 8, 0).unwrap();
+        {
+            let mut guard = writer.make_writer();
+            guard.write_all(b"new").unwrap();
+            guard.flush().unwrap();
+        }
+        startup_stderr.write_all(b"cause").unwrap();
+        startup_stderr.flush().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "newcause");
+        assert!(!rotated_log_path(&path, 1).exists());
+        drop(startup_stderr);
+        drop(writer);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

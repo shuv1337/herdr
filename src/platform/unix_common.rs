@@ -1,3 +1,26 @@
+/// Owns the launched child until readiness or failure has been observed.
+/// Dropping this receipt never terminates the detached daemon.
+pub(crate) struct ServerDaemon(std::process::Child);
+
+impl ServerDaemon {
+    pub(crate) fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.try_wait()
+    }
+}
+
+pub(crate) fn launch_server_daemon_command(
+    command: &mut std::process::Command,
+) -> std::io::Result<ServerDaemon> {
+    command
+        .spawn()
+        .map(ServerDaemon)
+        .map_err(super::daemon_spawn_error)
+}
+
 use std::path::{Path, PathBuf};
 
 pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
