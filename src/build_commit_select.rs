@@ -4,33 +4,50 @@
 //! child there, so HEAD stays on the bookmarked commit. `jj edit` of that
 //! bookmark makes `@` the commit itself, and HEAD slips to the parent.
 
-use std::{env, path::Path, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildCommit {
+    pub commit: Option<String>,
+    pub rerun_paths: Vec<PathBuf>,
+}
+
+#[cfg(not(test))]
 pub fn emit_build_commit(manifest_dir: &Path, jj: &std::ffi::OsStr) {
-    if env::var("HERDR_BUILD_COMMIT").map(|v| !v.trim().is_empty()) == Ok(true) {
+    if std::env::var("HERDR_BUILD_COMMIT").map(|v| !v.trim().is_empty()) == Ok(true) {
         return;
     }
+    let build_commit = build_commit(manifest_dir, jj);
+    for path in &build_commit.rerun_paths {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    if let Some(commit) = build_commit.commit {
+        println!("cargo:rustc-env=HERDR_BUILD_COMMIT={commit}");
+    }
+}
 
+pub fn build_commit(manifest_dir: &Path, jj: &std::ffi::OsStr) -> BuildCommit {
+    let mut rerun_paths = Vec::new();
     // Resolve paths through Git: `.git` is a file in a Git worktree.
     for name in ["HEAD", "refs/heads", "packed-refs"] {
         if let Some(path) = git_rev_parse(manifest_dir, &["--git-path", name]) {
             let path = manifest_dir.join(path);
             if path.exists() {
-                println!("cargo:rerun-if-changed={}", path.display());
+                rerun_paths.push(path);
             }
         }
     }
     let jj_dir = manifest_dir.join(".jj");
     if jj_dir.is_dir() {
         // @ can change without moving Git HEAD (for example, jj describe).
-        println!(
-            "cargo:rerun-if-changed={}",
-            jj_dir.join("working_copy/checkout").display()
-        );
+        rerun_paths.push(jj_dir.join("working_copy/checkout"));
         let repo = jj_dir.join("repo");
         let repo = if repo.is_file() {
             // Linked jj workspaces store the shared repository path in this file.
-            println!("cargo:rerun-if-changed={}", repo.display());
+            rerun_paths.push(repo.clone());
             std::fs::read_to_string(&repo)
                 .ok()
                 .map(|path| jj_dir.join(path.trim()))
@@ -38,24 +55,21 @@ pub fn emit_build_commit(manifest_dir: &Path, jj: &std::ffi::OsStr) {
         } else {
             repo
         };
-        println!(
-            "cargo:rerun-if-changed={}",
-            repo.join("op_heads/heads").display()
-        );
+        rerun_paths.push(repo.join("op_heads/heads"));
     }
 
     // Colocated jj sets Git HEAD to the parent of `@`. An empty child leaves
     // HEAD on the bookmarked commit. `jj edit` of that bookmark makes `@` the
     // commit itself, so HEAD is the parent and would be recorded instead.
-    let Some(git_head) = git_rev_parse(manifest_dir, &["HEAD"]) else {
-        return;
-    };
-    let working_copy = jj_working_copy(manifest_dir, jj);
-    let selected = select_build_commit(&git_head, working_copy.as_ref());
-    let commit = git_rev_parse(manifest_dir, &["--short=12", selected])
-        .or_else(|| git_rev_parse(manifest_dir, &["--short=12", "HEAD"]));
-    if let Some(commit) = commit {
-        println!("cargo:rustc-env=HERDR_BUILD_COMMIT={commit}");
+    let commit = git_rev_parse(manifest_dir, &["HEAD"]).and_then(|git_head| {
+        let working_copy = jj_working_copy(manifest_dir, jj);
+        let selected = select_build_commit(&git_head, working_copy.as_ref());
+        git_rev_parse(manifest_dir, &["--short=12", selected])
+            .or_else(|| git_rev_parse(manifest_dir, &["--short=12", "HEAD"]))
+    });
+    BuildCommit {
+        commit,
+        rerun_paths,
     }
 }
 
@@ -192,11 +206,33 @@ mod tests {
     }
 
     impl Fixture {
-        fn command(&self, program: &str, args: &[&str]) -> String {
-            let output = Command::new(program)
-                .args(args)
+        fn isolate<'a>(&self, command: &'a mut Command) -> &'a mut Command {
+            for name in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_COMMON_DIR",
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_CONFIG",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_PARAMETERS",
+            ] {
+                command.env_remove(name);
+            }
+            command
                 .current_dir(&self.0)
+                .env("GIT_CONFIG_GLOBAL", self.0.join("git-config"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("JJ_CONFIG", self.0.join("jj-config.toml"))
+        }
+
+        fn command(&self, program: &str, args: &[&str]) -> String {
+            let mut command = Command::new(program);
+            command.args(args);
+            let output = self
+                .isolate(&mut command)
                 .output()
                 .expect("fixture command must start");
             assert!(
@@ -212,11 +248,9 @@ mod tests {
 
         fn build(&self, override_commit: Option<&str>, jj: &OsStr) -> String {
             let mut command = Command::new(env!("CARGO"));
-            command
+            self.isolate(&mut command)
                 .args(["run", "--quiet", "--offline"])
-                .current_dir(&self.0)
                 .env("CARGO_TARGET_DIR", self.0.join("target"))
-                .env("JJ_CONFIG", self.0.join("jj-config.toml"))
                 .env("FIXTURE_JJ", jj)
                 .env_remove("HERDR_BUILD_COMMIT");
             if let Some(commit) = override_commit {
@@ -264,6 +298,7 @@ mod tests {
             "[user]\nname = 'Build Fixture'\nemail = 'fixture@example.invalid'\n",
         )
         .expect("isolated jj config");
+        fs::write(fixture.0.join("git-config"), "").expect("isolated git config");
         fs::write(fixture.0.join("Cargo.toml"), "[package]\nname = 'build-identity-fixture'\nversion = '0.0.0'\nedition = '2021'\n[workspace]\n").expect("fixture manifest");
         fs::write(
             fixture.0.join("src/main.rs"),
@@ -320,7 +355,22 @@ fn main() {
         );
         let working_copy = super::parse_jj_working_copy(&template).expect("real template parses");
         let parent = fixture.command("git", &["rev-parse", "HEAD"]);
-        super::emit_build_commit(&fixture.0, OsStr::new("jj"));
+        let build_commit = super::build_commit(&fixture.0, OsStr::new("jj"));
+        assert_eq!(
+            build_commit.commit.as_deref(),
+            Some(&working_copy.commit[..12])
+        );
+        for watched in [
+            ".git/HEAD",
+            ".jj/working_copy/checkout",
+            ".jj/repo/op_heads/heads",
+        ] {
+            assert!(
+                build_commit.rerun_paths.contains(&fixture.0.join(watched)),
+                "{watched} must be watched: {:?}",
+                build_commit.rerun_paths
+            );
+        }
         assert!(working_copy.has_bookmark && working_copy.described && !working_copy.empty);
         assert_eq!(working_copy.parent.as_deref(), Some(parent.as_str()));
         assert_eq!(
