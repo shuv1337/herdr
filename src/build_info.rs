@@ -62,6 +62,10 @@ fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+#[path = "build_commit_select.rs"]
+mod build_commit_select;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn stable_version_defaults_to_cargo_version() {

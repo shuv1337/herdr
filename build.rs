@@ -3,6 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "src/build_commit_select.rs"]
+mod build_commit_select;
+
 // Keep this pin aligned with vendor/libghostty-vt/build.zig.zon and release CI.
 const REQUIRED_ZIG_VERSION: &str = "0.16.0";
 
@@ -73,32 +76,6 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
-fn emit_build_commit(manifest_dir: &PathBuf) {
-    if env::var("HERDR_BUILD_COMMIT").map(|v| !v.trim().is_empty()) == Ok(true) {
-        return;
-    }
-
-    let git_dir = manifest_dir.join(".git");
-    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        git_dir.join("refs/heads").display()
-    );
-
-    let commit = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .current_dir(manifest_dir)
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    if let Some(commit) = commit {
-        println!("cargo:rustc-env=HERDR_BUILD_COMMIT={commit}");
-    }
-}
-
 fn validate_fork_revision() {
     let Ok(revision) = env::var("HERDR_FORK_REVISION") else {
         return;
@@ -137,7 +114,7 @@ fn main() {
     );
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    emit_build_commit(&manifest_dir);
+    build_commit_select::emit_build_commit(&manifest_dir, std::ffi::OsStr::new("jj"));
     let vendored_dir = manifest_dir.join("vendor/libghostty-vt");
     let optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());
     let simd = env_bool("LIBGHOSTTY_VT_SIMD").unwrap_or(true);
