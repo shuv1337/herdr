@@ -1,32 +1,85 @@
-# Trusted validation policy: takes effect after merging into the default branch.
-# Keep command selection on that trusted branch (never opt into branch commands).
+# Trusted policy: effective only after merging into the default branch.
 allow_repo_commands: false
-# Project instructions include live detection smoke tests for maintainers; gate
-# agents must not inherit that operator role or the captain's session context.
+# Do not inherit maintainer instructions for driving an existing Herdr session.
 disable_project_settings: true
 
 commands:
   test: "just ci-tests"
   lint: "just lint"
 
-# The agent timeout is a global-only setting, not a supported repository key.
-# Bound scope here to deterministic checks within the default 30-minute budget.
+# v1.72.0 always runs Test evidence after the baseline. Timeouts are global-only;
+# the 30-minute evidence budget does not impose a deadline on commands.test.
 test:
   instructions: &validation_safety |
-    Validation is limited to deterministic, offline unit and contract checks.
-    Use just ci-tests for tests and just lint for lint. Do not run just check,
-    windows-lint, or just setup-windows-cross; do not accept the Windows SDK license.
-    Keep validation within the pipeline agent's 30-minute limit. If checks cannot
-    finish within that budget, report incomplete validation rather than expanding
-    scope or starting live smoke tests.
-    Never run herdr CLI or API commands against any live session or pane.
-    Never run herdr server commands. Never write or remove overrides under
-    ~/.config/herdr/agent-detection/. Never start a named Herdr session outside
-    a disposable throwaway; this pipeline must not start even a throwaway session.
-    Record agent-detection compatibility claims and missing live evidence for a
-    maintainer to validate separately; do not live-test them in the pipeline.
+    Shared safety policy for every agent receiving this text:
+    Never drive the captain's or any pre-existing Herdr server, session, or pane.
+    Never invoke installed herdr (including ~/.local/bin/herdr), cargo run,
+    just bench-release-smoke, or a built Herdr binary with inherited environment.
+    Never use .agents/skills/herdr-throwaway-repro or its current-session setup.
+    Never write or remove the real ~/.config/herdr/agent-detection/ overrides.
+    Never run just check, windows-lint, or just setup-windows-cross, and never
+    accept the Windows SDK license. Tests use just ci-tests; lint uses just lint.
+    Review and Document agents must not start or drive Herdr at all. The only
+    permitted manual runtime evidence is a Test agent's private instance below.
+    Missing CLI-agent compatibility evidence is recorded for a maintainer;
+    do not start real coding agents, contact providers, or use real user credentials.
+
+    Test live-validation runbook (only when the requested scenario needs it):
+    Prefer an existing focused integration test that drives the requested behavior
+    with private sockets; cite its observable result as scenario evidence. Passing
+    the baseline alone is not live evidence. No repo key skips the evidence turn.
+    If a manual scenario is necessary, build the worktree binary with
+    cargo build --locked --bin herdr. Do not launch it during the build. Resolve
+    its absolute path from cargo metadata --no-deps --format-version 1's
+    target_directory plus debug/herdr; never resolve the installed binary via PATH.
+
+    Use one Python supervisor for the entire scenario and cleanup. In its try/finally,
+    create a fresh tempfile.TemporaryDirectory(prefix='herdr-nm-') under /tmp;
+    do not reuse any existing directory. Create private home, config, data, state,
+    cache, and runtime directories underneath it, all mode 0700. Construct a child
+    environment by copying os.environ except EVERY key starting with HERDR_
+    (explicitly including HERDR_ENV, HERDR_SOCKET_PATH, HERDR_CLIENT_SOCKET_PATH,
+    HERDR_SESSION and pane identifiers). Do not print the original environment.
+    Set HOME and XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, XDG_CACHE_HOME,
+    XDG_RUNTIME_DIR to those private directories; set SHELL=/bin/sh. Set
+    XDG_CONFIG_DIRS and XDG_DATA_DIRS to private empty directories as well.
+    Set only the new HERDR_SOCKET_PATH to <temp>/runtime/api.sock. Write
+    <temp>/config/herdr-dev/config.toml with onboarding = false for the debug build.
+    Use that exact sanitized environment, absolute worktree binary, and private
+    cwd for EVERY server, CLI, or API client invocation. Never fall back to an
+    inherited socket, default socket discovery, a connection profile, or a remote host.
+
+    Start [absolute_binary, 'server'] with subprocess.Popen, start_new_session=True,
+    and a private PTY from pty.openpty() (matching tests/server_headless.rs).
+    Retain the PTY master, drain output, and close the parent's slave after spawn.
+    Track the process and its process group before doing anything else. Wait with
+    a bounded deadline for that process to remain alive and api.sock to appear;
+    fail closed if startup fails. Drive only this server through the same explicit
+    private socket. Named sessions are unnecessary and forbidden. Any server
+    lifecycle or manifest reload command, if required by the scenario, must use
+    only this private instance and environment; never reload the shared server.
+    Any detection override must be inside the private config directory, never
+    under the real home. Never reach out to an existing pane to obtain evidence.
+
+    Bound manual commands and the scenario below the remaining 30-minute evidence
+    budget. On failure or timeout report incomplete evidence; do not expand scope.
+    In finally, if the private socket exists, first request server stop through
+    the absolute binary and the same sanitized private environment, with a short
+    timeout, so the server can clean up its own panes. Then terminate ONLY the
+    tracked private process groups, wait with a
+    deadline, kill those same groups if needed, reap children, close PTY descriptors,
+    then remove the private temp directory. Never pkill/killall or stop by global
+    session name. Keep evidence outside the temp directory before removing it.
+    The recipe is a code-derived runbook, not yet exercised: record exactly what
+    was attempted and never claim live compatibility from configuration alone.
 
 review:
   path_instructions:
     - path: "**"
       instructions: *validation_safety
+
+document:
+  instructions: *validation_safety
+# v1.72.0 has no lint-fix or CI-repair instructions fields. Do not invent them:
+# project settings suppression applies globally; these runbooks reach only the
+# Test, Review, and Document agent surfaces supported by this version.
