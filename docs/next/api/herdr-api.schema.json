@@ -9503,6 +9503,12 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "session_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "pong",
                   "type": "string"

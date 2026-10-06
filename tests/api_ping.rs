@@ -314,6 +314,7 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["id"], "req_1");
     assert_eq!(value["result"]["type"], "pong");
     assert_eq!(value["result"]["version"], expected_build_version());
+    assert_eq!(value["result"]["session_name"], "default");
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
     assert_eq!(value["result"]["protocol"], 22);
@@ -2680,6 +2681,7 @@ fn native_runtime_attachment_public_json_persists_identity_and_rejects_stale_rep
         )
     };
     let ping = request("ping", serde_json::json!({}));
+    assert_eq!(ping["result"]["session_name"], "native-runtime-test");
     for method in [
         "pane.bind_runtime",
         "pane.get_runtime",

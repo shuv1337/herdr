@@ -449,6 +449,10 @@ fn handle_request(
             result: ResponseResult::Pong {
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
+                session_name: Some(
+                    crate::session::active_name()
+                        .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.into()),
+                ),
                 capabilities,
             },
         })

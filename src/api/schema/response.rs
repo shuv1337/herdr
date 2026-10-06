@@ -45,6 +45,8 @@ pub enum ResponseResult {
     Pong {
         version: String,
         protocol: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_name: Option<String>,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
     },
