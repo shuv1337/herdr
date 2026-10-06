@@ -15,7 +15,9 @@ pub(crate) const DEFAULT_TTL_MS: u64 = 30_000;
 
 impl RuntimeAttachment {
     // Only the read-only native attachment entrypoint may be persisted for restore.
-    // Arbitrary commands and credentials do not belong in a display binding.
+    // The local command API already grants terminal input authority. This validates
+    // the trusted caller's attach descriptor shape, not executable/script contents.
+    // Source and compiled commands remain caller-owned; credential flags are excluded.
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if self.provider != "shuvcode"
             || [
@@ -141,8 +143,10 @@ impl TerminalState {
     }
 
     pub(crate) fn runtime_state_at(&self, now: Instant) -> AgentState {
-        if self.runtime_expiry().is_some_and(|deadline| now < deadline) {
-            return self.runtime_binding.as_ref().unwrap().state.detect();
+        if let Some(binding) = &self.runtime_binding {
+            if self.runtime_expiry().is_some_and(|deadline| now < deadline) {
+                return binding.state.detect();
+            }
         }
         AgentState::Unknown
     }

@@ -32,6 +32,7 @@ struct PaneRestoreStartup<'a> {
     initial_history_ansi: Option<&'a str>,
     duplicate_agent_session: bool,
     reserved_agent_session: Option<String>,
+    restore_error: Option<&'static str>,
 }
 
 struct RestoreRuntimeContext<'a> {
@@ -697,6 +698,7 @@ fn restore_tab(
                     }
                 }
                 terminal.restore_runtime_binding(saved_runtime_binding);
+                terminal.restore_error = startup.restore_error.map(str::to_owned);
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
                 }
@@ -814,28 +816,36 @@ fn pane_restore_startup<'a>(
     agent_restore: &mut AgentRestoreState<'_>,
 ) -> PaneRestoreStartup<'a> {
     if let Some(binding) = runtime {
-        // Display attachment wins over inferred Session resume, even when ordinary agent
-        // resume is disabled. This command only attaches a view to existing native work.
-        let plan =
-            binding
-                .attachment
-                .validate()
-                .ok()
-                .map(|_| crate::agent_resume::AgentResumePlan {
-                    agent: binding.attachment.provider.clone(),
-                    argv: binding.attachment.attach_argv.clone(),
-                    dedupe_key: format!("runtime:{}", binding.binding_id),
-                });
+        // Ordinary agent resume controls execution admission. Native view restoration is
+        // independent: the trusted descriptor only attaches to an existing native Session.
+        // It cannot replace the missing Session or fall back to inferred execution resume.
+        let validation = binding.attachment.validate();
+        let plan = validation
+            .as_ref()
+            .ok()
+            .map(|_| crate::agent_resume::AgentResumePlan {
+                agent: binding.attachment.provider.clone(),
+                argv: binding.attachment.attach_argv.clone(),
+                dedupe_key: format!("runtime:{}", binding.binding_id),
+            });
         let duplicate = plan.as_ref().is_some_and(|plan| {
             !agent_restore
                 .resumed_sessions
                 .insert(plan.dedupe_key.clone())
         });
+        let reserved_agent_session = plan
+            .as_ref()
+            .filter(|_| !duplicate)
+            .map(|plan| plan.dedupe_key.clone());
         return PaneRestoreStartup {
             restore_plan: plan.filter(|_| !duplicate),
-            initial_history_ansi: None,
+            initial_history_ansi: validation
+                .is_err()
+                .then(|| history.map(|history| history.ansi.as_str()))
+                .flatten(),
             duplicate_agent_session: duplicate,
-            reserved_agent_session: None,
+            reserved_agent_session,
+            restore_error: validation.err(),
         };
     }
     // Native agent resume owns the conversation history. If a pane has a
@@ -875,6 +885,7 @@ fn pane_restore_startup<'a>(
         },
         duplicate_agent_session,
         reserved_agent_session,
+        restore_error: None,
     }
 }
 
@@ -2025,15 +2036,27 @@ mod tests {
             resumed_sessions: &mut resumed,
         };
         let startup = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
+        let reservation = startup.reserved_agent_session.clone().unwrap();
         assert_eq!(
             startup.restore_plan.unwrap().argv,
             binding.attachment.attach_argv
         );
         let duplicate = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
         assert!(duplicate.restore_plan.is_none());
+        assert!(duplicate.reserved_agent_session.is_none());
+        state.resumed_sessions.remove(&reservation);
+        let retry = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
+        assert!(retry.restore_plan.is_some());
         binding.attachment.attach_argv.push("--password".into());
         state.enabled = true;
-        let rejected = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
+        let history = PaneHistorySnapshot {
+            ansi: "KEEP_HISTORY\r\n".into(),
+            lines: 1,
+        };
+        let rejected =
+            pane_restore_startup(Some(&session), Some(&binding), Some(&history), &mut state);
+        assert_eq!(rejected.initial_history_ansi, Some("KEEP_HISTORY\r\n"));
+        assert!(rejected.restore_error.is_some());
         assert!(
             rejected.restore_plan.is_none(),
             "invalid exact attachment must not fall back to bare Session resume"

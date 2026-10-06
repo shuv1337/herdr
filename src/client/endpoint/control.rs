@@ -89,6 +89,7 @@ mod tests {
             boot_id: "boot".into(),
             revision: 3,
             completions: [("pane".into(), 7)].into_iter().collect(),
+            managed_statuses: Default::default(),
         };
         let crate::protocol::ServerMessage::EndpointControl { kind, data } =
             crate::protocol::endpoint::agent_completions_message(&projection).unwrap()

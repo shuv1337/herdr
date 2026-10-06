@@ -162,28 +162,33 @@ impl App {
             && previous_detect_state == binding.state.detect();
         if same_detect_transition {
             self.state.next_agent_state_change_seq += 1;
-            let terminal = self.state.terminals.get_mut(&terminal_id).unwrap();
-            terminal.last_agent_state_change_seq = Some(self.state.next_agent_state_change_seq);
-            terminal.last_agent_completion_seq = (binding.state == RuntimeState::Done)
-                .then_some(self.state.next_agent_state_change_seq);
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.last_agent_state_change_seq = Some(self.state.next_agent_state_change_seq);
+                terminal.last_agent_completion_seq = (binding.state == RuntimeState::Done)
+                    .then_some(self.state.next_agent_state_change_seq);
+            }
+            if binding.state == RuntimeState::Done {
+                self.state.publish_runtime_completion(ws_idx, pane_id);
+            }
         }
         if let Some(update) = &update {
             self.emit_pane_state_update(update);
         }
         if same_detect_transition && update.is_none() {
-            let pane = self.pane_info(ws_idx, pane_id).unwrap();
-            self.emit_event(crate::api::schema::EventEnvelope {
-                event: crate::api::schema::EventKind::PaneAgentStatusChanged,
-                data: crate::api::schema::EventData::PaneAgentStatusChanged {
-                    pane_id: binding.pane_id.clone(),
-                    workspace_id: pane.workspace_id,
-                    agent_status: pane.agent_status,
-                    agent: pane.agent,
-                    title: pane.title,
-                    display_agent: pane.display_agent,
-                    state_labels: pane.state_labels,
-                },
-            });
+            if let Some(pane) = self.pane_info(ws_idx, pane_id) {
+                self.emit_event(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+                    data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                        pane_id: binding.pane_id.clone(),
+                        workspace_id: pane.workspace_id,
+                        agent_status: pane.agent_status,
+                        agent: pane.agent,
+                        title: pane.title,
+                        display_agent: pane.display_agent,
+                        state_labels: pane.state_labels,
+                    },
+                });
+            }
         }
         self.sync_agent_metadata_deadline();
         self.schedule_session_save();
@@ -450,6 +455,8 @@ mod tests {
     #[test]
     fn runtime_attachment_done_heartbeats_preserve_completion_sequence() {
         let mut app = app();
+        app.state.outer_terminal_focus = Some(false);
+        app.state.toast_config.delay_seconds = 1;
         let pane_id = app
             .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
             .unwrap();
@@ -475,6 +482,7 @@ mod tests {
         app.handle_pane_report_runtime("done".into(), report(2, RuntimeState::Done));
         let completion = app.state.terminals[&terminal_id].last_agent_completion_seq;
         assert!(completion > before);
+        let notification = app.state.pending_agent_notifications[&raw].clone();
         let seen = app.state.workspaces[0].pane_state(raw).unwrap().seen;
         app.handle_pane_report_runtime("heartbeat".into(), report(3, RuntimeState::Done));
         assert_eq!(
@@ -487,11 +495,54 @@ mod tests {
         );
         assert_eq!(app.state.workspaces[0].pane_state(raw).unwrap().seen, seen);
         assert_eq!(
+            app.state.pending_agent_notifications[&raw].deadline,
+            notification.deadline
+        );
+        assert_eq!(
             app.pane_info(0, raw).unwrap().agent_status,
             crate::api::schema::AgentStatus::Done
         );
         assert!(!app.state.terminals[&terminal_id].runtime_presentation_seen(true));
         app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn runtime_attachment_restored_or_expired_done_does_not_replay_notifications() {
+        let mut app = app();
+        app.state.outer_terminal_focus = Some(false);
+        app.state.toast_config.delay_seconds = 1;
+        let pane_id = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap();
+        app.handle_pane_bind_runtime(
+            "bind".into(),
+            PaneBindRuntimeParams {
+                pane_id: pane_id.clone(),
+                binding_id: "binding-a".into(),
+                attachment: attachment(),
+            },
+        );
+        let (_, raw, terminal_id) = app.runtime_binding_target(&pane_id).unwrap();
+        for seq in [1, 2] {
+            app.handle_pane_report_runtime(
+                "done".into(),
+                PaneReportRuntimeParams {
+                    pane_id: pane_id.clone(),
+                    binding_id: "binding-a".into(),
+                    seq,
+                    state: RuntimeState::Done,
+                    label: None,
+                    ttl_ms: None,
+                },
+            );
+            assert!(app.state.pending_agent_notifications.is_empty());
+            assert_eq!(
+                app.pane_info(0, raw).unwrap().agent_status,
+                crate::api::schema::AgentStatus::Done
+            );
+            app.state.terminals.get_mut(&terminal_id).unwrap().state =
+                crate::detect::AgentState::Unknown;
+        }
     }
 
     #[test]
@@ -547,6 +598,62 @@ mod tests {
                 }
             )
             .contains("\"applied\":true"));
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn runtime_attachment_unbound_owner_follows_same_physical_pane_move() {
+        let mut app = app();
+        let pane_id = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap();
+        let bind = PaneBindRuntimeParams {
+            pane_id: pane_id.clone(),
+            binding_id: "binding-a".into(),
+            attachment: attachment(),
+        };
+        assert!(app
+            .handle_pane_bind_runtime("bind".into(), bind.clone())
+            .contains("\"applied\":true"));
+        assert!(app
+            .handle_pane_unbind_runtime(
+                "unbind".into(),
+                PaneUnbindRuntimeParams {
+                    pane_id: pane_id.clone(),
+                    binding_id: "binding-a".into(),
+                }
+            )
+            .contains("\"applied\":true"));
+        let terminal_id = app.runtime_binding_target(&pane_id).unwrap().2;
+        let moved: SuccessResponse = serde_json::from_str(&app.handle_pane_move(
+            "move".into(),
+            crate::api::schema::PaneMoveParams {
+                pane_id,
+                destination: crate::api::schema::PaneMoveDestination::NewWorkspace {
+                    label: None,
+                    tab_label: None,
+                },
+                focus: false,
+            },
+        ))
+        .unwrap();
+        let ResponseResult::PaneMove { move_result } = moved.result else {
+            panic!("move failed")
+        };
+        let mut moved_bind = bind;
+        moved_bind.pane_id = move_result.pane.pane_id;
+        assert_eq!(
+            app.runtime_binding_target(&moved_bind.pane_id).unwrap().2,
+            terminal_id
+        );
+        assert!(app
+            .handle_pane_bind_runtime("rebind".into(), moved_bind.clone())
+            .contains("\"applied\":true"));
+        moved_bind.attachment.home_id = "changed-home".into();
+        moved_bind.attachment.attach_argv[6] = "changed-home".into();
+        assert!(app
+            .handle_pane_bind_runtime("replace".into(), moved_bind)
+            .contains("runtime_binding_conflict"));
         app.state.assert_invariants_for_test();
     }
 }

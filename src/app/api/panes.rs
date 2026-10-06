@@ -1276,6 +1276,11 @@ impl App {
         };
 
         if let Some(public_id) = self.public_pane_id(target_ws_idx, moved_pane_id) {
+            for owner in self.state.runtime_binding_owners.values_mut() {
+                if owner.pane_id == previous_pane_id {
+                    owner.pane_id = public_id.clone();
+                }
+            }
             if let Some(terminal_id) = self.state.workspaces[target_ws_idx]
                 .terminal_id(moved_pane_id)
                 .cloned()

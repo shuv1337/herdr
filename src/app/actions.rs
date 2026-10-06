@@ -1765,6 +1765,20 @@ impl AppState {
         update.agent_released.then_some(update)
     }
 
+    pub(crate) fn publish_runtime_completion(&mut self, ws_idx: usize, pane_id: PaneId) {
+        let Some(terminal) = self.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
+        else {
+            return;
+        };
+        let mut change = terminal.unchanged_effective_state_change_at(Instant::now());
+        // Native Done can observe work completed between two Idle reports.
+        // Reuse the existing completion delivery policy for that semantic edge.
+        change.previous_state = AgentState::Working;
+        self.apply_pane_state_change(ws_idx, pane_id, &change, false);
+    }
+
     fn apply_pane_state_change(
         &mut self,
         ws_idx: usize,

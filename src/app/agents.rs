@@ -194,11 +194,11 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        let mut argv = vec![if params.kind == "shuvcode" {
-            "shuvcode".to_string()
-        } else {
-            crate::detect::interactive_agent_executable(kind).to_string()
-        }];
+        let distribution = crate::detect::distinct_distribution_label(kind, &params.kind);
+        let mut argv = vec![distribution
+            .as_deref()
+            .unwrap_or_else(|| crate::detect::interactive_agent_executable(kind))
+            .to_string()];
         argv.extend(params.args);
         let command = crate::platform::interactive_shell_command(&argv, &shell_name)
             .ok_or(AgentStartError::InvalidArgument)?;
@@ -219,6 +219,7 @@ impl App {
             .get_mut(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
         terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
+        terminal.set_managed_agent_distribution_label(distribution);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));

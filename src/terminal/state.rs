@@ -2046,6 +2046,12 @@ impl TerminalState {
         })
     }
 
+    pub(crate) fn set_managed_agent_distribution_label(&mut self, label: Option<String>) {
+        if let (Some(label), Some(owner)) = (label, self.agent_name_owner.as_mut()) {
+            owner.agent_label = label;
+        }
+    }
+
     pub fn managed_agent_interactive_ready(&self) -> bool {
         self.managed_agent
             .is_some_and(|managed| matches!(managed.phase, ManagedAgentPhase::Active))
@@ -2377,6 +2383,28 @@ mod tests {
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), true));
         assert_eq!(terminal.agent_name, None);
+    }
+
+    #[test]
+    fn managed_agent_retains_normalized_distribution_name_owner() {
+        let mut terminal = test_terminal();
+        terminal.begin_managed_agent(
+            "native".into(),
+            Agent::OpenCode,
+            Instant::now(),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        terminal.set_managed_agent_distribution_label(crate::detect::distinct_distribution_label(
+            Agent::OpenCode,
+            "Shuvcode",
+        ));
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        assert_eq!(terminal.agent_name.as_deref(), Some("native"));
+        assert_eq!(
+            terminal.agent_name_owner.as_ref().unwrap().agent_label,
+            "shuvcode"
+        );
     }
 
     #[test]

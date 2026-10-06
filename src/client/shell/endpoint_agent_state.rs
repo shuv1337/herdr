@@ -9,6 +9,8 @@ pub(super) struct EndpointAgentPresentation {
     acknowledged: HashMap<String, u64>,
     completed: HashMap<String, u64>,
     working: HashSet<String>,
+    managed_statuses: std::collections::BTreeMap<String, AgentStatus>,
+    managed_revision: Option<(Option<u64>, u64)>,
     pending_completions: Option<(
         Option<u64>,
         crate::protocol::endpoint::EndpointAgentCompletions,
@@ -50,6 +52,8 @@ impl EndpointAgentPresentation {
             self.acknowledged.clear();
             self.completed.clear();
             self.working.clear();
+            self.managed_statuses.clear();
+            self.managed_revision = None;
             self.acknowledged.extend(
                 snapshot
                     .agents
@@ -68,7 +72,7 @@ impl EndpointAgentPresentation {
             .retain(|pane_id, _| pane_ids.contains(pane_id.as_str()));
         self.working
             .retain(|pane_id| pane_ids.contains(pane_id.as_str()));
-        let completions = self
+        let projection = self
             .pending_completions
             .take()
             .filter(|(received_generation, projection)| {
@@ -76,7 +80,15 @@ impl EndpointAgentPresentation {
                     && projection.boot_id == snapshot.boot_id
                     && projection.revision == snapshot.revision
             })
-            .map(|(_, projection)| projection.completions);
+            .map(|(_, projection)| projection);
+        if let Some(projection) = &projection {
+            self.managed_statuses = projection.managed_statuses.clone();
+            self.managed_revision = Some((generation, snapshot.revision));
+        } else if self.managed_revision != Some((generation, snapshot.revision)) {
+            self.managed_statuses.clear();
+            self.managed_revision = None;
+        }
+        let completions = projection.map(|projection| projection.completions);
         for agent in &mut snapshot.agents {
             match agent.agent_status {
                 AgentStatus::Working => {
@@ -162,6 +174,9 @@ impl EndpointAgentPresentation {
     }
 
     fn projected_status(&self, agent: &ClientShellAgent) -> AgentStatus {
+        if let Some(status) = self.managed_statuses.get(&agent.pane_id) {
+            return *status;
+        }
         match agent.agent_status {
             AgentStatus::Idle | AgentStatus::Done => {
                 if self.seen(agent) {
@@ -283,6 +298,59 @@ mod tests {
         assert_eq!(snapshot.agents[0].agent_status, AgentStatus::Idle);
     }
 
+    fn native_completions(revision: u64, seq: u64) -> EndpointAgentCompletions {
+        serde_json::from_value(serde_json::json!({
+            "boot_id": "endpoint-boot",
+            "revision": revision,
+            "completions": { "agent-pane": seq },
+            "managed_statuses": { "agent-pane": "done" }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn native_runtime_done_is_visible_after_unknown_baseline() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut initial = snapshot(AgentStatus::Unknown, 1, 1);
+        presentation.project_snapshot(&mut initial);
+        presentation.receive_completions(None, native_completions(2, 2));
+        let mut completed = snapshot(AgentStatus::Done, 2, 2);
+        presentation.project_snapshot(&mut completed);
+        assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
+        assert!(presentation.acknowledge_surface(&mut completed, &surface(2), Some(true)));
+        assert!(presentation.seen(&completed.agents[0]));
+        assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn native_runtime_done_is_visible_in_first_snapshot() {
+        let mut presentation = EndpointAgentPresentation::default();
+        presentation.receive_completions(None, native_completions(1, 2));
+        let mut completed = snapshot(AgentStatus::Done, 2, 1);
+        presentation.project_snapshot(&mut completed);
+        assert!(presentation.seen(&completed.agents[0]));
+        assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn native_runtime_authority_requires_a_coherent_optional_companion() {
+        for (boot, revision, generation) in [
+            ("old-boot", 2, Some(1)),
+            ("endpoint-boot", 1, Some(1)),
+            ("endpoint-boot", 2, Some(0)),
+        ] {
+            let mut presentation = EndpointAgentPresentation::default();
+            let mut initial = snapshot(AgentStatus::Idle, 1, 1);
+            presentation.project_snapshot_for_generation(&mut initial, Some(1));
+            let mut projection = native_completions(revision, 2);
+            projection.boot_id = boot.into();
+            presentation.receive_completions(generation, projection);
+            let mut current = snapshot(AgentStatus::Done, 2, 2);
+            presentation.project_snapshot_for_generation(&mut current, Some(1));
+            assert_eq!(current.agents[0].agent_status, AgentStatus::Idle);
+        }
+    }
+
     fn assert_idle_sequence(states: &[(AgentStatus, u64)]) {
         let mut presentation = EndpointAgentPresentation::default();
         let mut projected = AgentStatus::Unknown;
@@ -302,6 +370,7 @@ mod tests {
                 .map(|seq| ("agent-pane".into(), seq))
                 .into_iter()
                 .collect(),
+            managed_statuses: Default::default(),
         }
     }
 

@@ -38,6 +38,9 @@ pub struct EndpointAgentCompletions {
     pub boot_id: String,
     pub revision: u64,
     pub completions: std::collections::BTreeMap<String, u64>,
+    /// Optional runtime authority, independent of each client's acknowledgement.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub managed_statuses: std::collections::BTreeMap<String, crate::api::schema::AgentStatus>,
 }
 
 fn default_true() -> bool {

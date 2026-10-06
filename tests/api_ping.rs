@@ -2873,7 +2873,7 @@ fn native_runtime_attachment_agent_start_preserves_shuvcode_distribution() {
     thread::sleep(Duration::from_millis(500));
     let started = request(
         "agent.start",
-        serde_json::json!({"pane_id":pane,"name":"native-test","kind":"shuvcode"}),
+        serde_json::json!({"pane_id":pane,"name":"native-test","kind":"Shuvcode"}),
     );
     assert_eq!(started["result"]["argv"][0], "shuvcode", "{started}");
     support::wait_for_file(&base.join("invoked"), Duration::from_secs(3));

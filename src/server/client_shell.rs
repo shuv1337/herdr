@@ -33,6 +33,17 @@ pub(super) fn snapshot_with_completions(
             .iter()
             .filter_map(|agent| agent.completion_seq.map(|seq| (agent.pane_id.clone(), seq)))
             .collect(),
+        managed_statuses: app
+            .state
+            .terminals
+            .values()
+            .filter_map(|terminal| {
+                terminal
+                    .runtime_binding
+                    .as_ref()
+                    .map(|binding| (binding.pane_id.clone(), terminal.runtime_agent_status(true)))
+            })
+            .collect(),
     };
     let focused_workspace_id = location
         .and_then(|location| location.focused_workspace_id.clone())
