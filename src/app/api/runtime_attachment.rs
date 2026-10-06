@@ -266,26 +266,27 @@ mod tests {
     }
 
     fn attachment() -> RuntimeAttachment {
+        let root = std::env::temp_dir();
+        let location = root.join("herdr-native-project").display().to_string();
         RuntimeAttachment {
             provider: "shuvcode".into(),
             home_id: "home-a".into(),
             session_id: "ses_a".into(),
-            location: "/project-a".into(),
+            location: location.clone(),
             host_id: "local".into(),
             attach_argv: [
-                "/bin/shuvcode",
-                "supervisor",
-                "attach",
-                "--home",
-                "/home/native",
-                "--home-id",
-                "home-a",
-                "--session",
-                "ses_a",
-                "--location",
-                "/project-a",
+                root.join("shuvcode").display().to_string(),
+                "supervisor".into(),
+                "attach".into(),
+                "--home".into(),
+                root.join("herdr-native-home").display().to_string(),
+                "--home-id".into(),
+                "home-a".into(),
+                "--session".into(),
+                "ses_a".into(),
+                "--location".into(),
+                location,
             ]
-            .map(String::from)
             .into(),
         }
     }

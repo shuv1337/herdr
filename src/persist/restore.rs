@@ -1977,30 +1977,30 @@ mod tests {
     }
     #[test]
     fn runtime_attachment_restore_uses_exact_native_argv_over_bare_session() {
+        let location = test_session_path("native-project");
         let attachment = crate::api::schema::RuntimeAttachment {
             provider: "shuvcode".into(),
             home_id: "home-a".into(),
             session_id: "ses_exact".into(),
-            location: "/project/exact".into(),
+            location: location.clone(),
             host_id: "local".into(),
             attach_argv: [
-                "/bin/bun",
-                "--no-env-file",
-                "--preload",
-                "/source/preload.js",
-                "/source/index.ts",
-                "supervisor",
-                "attach",
-                "--home",
-                "/native/home",
-                "--home-id",
-                "home-a",
-                "--session",
-                "ses_exact",
-                "--location",
-                "/project/exact",
+                test_session_path("bun"),
+                "--no-env-file".into(),
+                "--preload".into(),
+                test_session_path("preload.js"),
+                test_session_path("index.ts"),
+                "supervisor".into(),
+                "attach".into(),
+                "--home".into(),
+                test_session_path("native-home"),
+                "--home-id".into(),
+                "home-a".into(),
+                "--session".into(),
+                "ses_exact".into(),
+                "--location".into(),
+                location,
             ]
-            .map(String::from)
             .into(),
         };
         let mut binding = crate::api::schema::RuntimeBinding {
