@@ -424,6 +424,10 @@ mod tests {
             version: version.map(str::to_owned),
             protocol: Some(crate::protocol::PROTOCOL_VERSION),
             capabilities: Some(crate::api::schema::ServerCapabilities {
+                runtime_attachment_methods: crate::runtime_attachment::METHODS
+                    .iter()
+                    .map(|method| (*method).into())
+                    .collect(),
                 live_handoff: true,
                 direct_control_yields_to_shell: true,
                 detached_server_daemon: true,

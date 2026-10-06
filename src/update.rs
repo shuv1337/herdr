@@ -2947,6 +2947,10 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: Some(crate::api::schema::ServerCapabilities {
+                runtime_attachment_methods: crate::runtime_attachment::METHODS
+                    .iter()
+                    .map(|method| (*method).into())
+                    .collect(),
                 live_handoff: true,
                 direct_control_yields_to_shell: false,
                 detached_server_daemon: true,
@@ -3023,6 +3027,10 @@ mod tests {
                 version: Some("0.6.2".to_string()),
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
+                    runtime_attachment_methods: crate::runtime_attachment::METHODS
+                        .iter()
+                        .map(|method| (*method).into())
+                        .collect(),
                     live_handoff: true,
                     direct_control_yields_to_shell: false,
                     detached_server_daemon: true,
@@ -3283,6 +3291,10 @@ mod tests {
                 version: Some("9.8.6".to_string()),
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
+                    runtime_attachment_methods: crate::runtime_attachment::METHODS
+                        .iter()
+                        .map(|method| (*method).into())
+                        .collect(),
                     live_handoff: true,
                     direct_control_yields_to_shell: false,
                     detached_server_daemon: true,

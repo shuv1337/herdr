@@ -18,6 +18,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "integration.install",
     "integration.list",
     "layout.set_split_ratio",
+    "pane.bind_runtime",
     "pane.clear",
     "pane.close",
     "pane.copy_motion",
@@ -25,15 +26,18 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "pane.edit_scrollback",
     "pane.focus",
     "pane.focus_direction",
+    "pane.get_runtime",
     "pane.input.set",
     "pane.link.activate",
     "pane.link.resolve",
     "pane.rename",
+    "pane.report_runtime",
     "pane.resize",
     "pane.scroll",
     "pane.selection.read",
     "pane.split",
     "pane.swap",
+    "pane.unbind_runtime",
     "pane.zoom",
     "product_announcement.dismiss",
     "release_notes.dismiss",
@@ -298,6 +302,22 @@ mod tests {
             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
         );
 
+        assert_eq!(
+            actual.remove("pane.bind_runtime").as_deref(),
+            Some("d8844d81243a877e09787c33bebe233150b5b606a10b3059f2d995fe3a1d6522")
+        );
+        assert_eq!(
+            actual.remove("pane.get_runtime").as_deref(),
+            Some("27d42b0cbf27f53793f0ccb05e07551667e06a1164327cc61d80a16d7ce08e76")
+        );
+        assert_eq!(
+            actual.remove("pane.report_runtime").as_deref(),
+            Some("b31b389ad16d208726cb21c7ec94e9b765cfdc6fc3405578e094710554c62215")
+        );
+        assert_eq!(
+            actual.remove("pane.unbind_runtime").as_deref(),
+            Some("dce43dc8cb245e22535169dc4b454d72506ade1ea137663af0966a05c1d97df5")
+        );
         assert_eq!(
             actual, expected,
             "an existing endpoint method changed shape; add load-bearing behavior as a new advertised method or explicitly gate new fields"

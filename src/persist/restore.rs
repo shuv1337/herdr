@@ -267,6 +267,18 @@ fn restore_with_imports_and_failures(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
+    // Closed attachment owners still reserve public identity after an empty restart.
+    crate::workspace::reserve_public_workspace_ids(
+        snapshot
+            .runtime_binding_owners
+            .values()
+            .filter_map(|binding| {
+                binding
+                    .pane_id
+                    .split_once(':')
+                    .map(|(workspace, _)| workspace)
+            }),
+    );
     let history = history.filter(|history| {
         let matches = history.layout_fingerprint.is_some()
             && history.layout_fingerprint == super::snapshot::layout_fingerprint(snapshot);
@@ -452,6 +464,7 @@ fn unavailable_restored_terminal(
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
+        terminal.restore_runtime_binding(pane.runtime_binding.as_ref());
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
@@ -508,7 +521,12 @@ fn restore_tab(
         let old_id = reverse_id_map.get(id);
         let saved_pane = old_id.and_then(|old_id| snap.panes.get(old_id));
         let saved_cwd = saved_pane
-            .map(|p| p.cwd.clone())
+            .map(|p| {
+                p.runtime_binding
+                    .as_ref()
+                    .map(|binding| PathBuf::from(&binding.attachment.location))
+                    .unwrap_or_else(|| p.cwd.clone())
+            })
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
 
         let cwd = saved_cwd;
@@ -531,7 +549,10 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
-        let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
+        let saved_runtime_binding = saved_pane.and_then(|p| p.runtime_binding.as_ref());
+        let saved_agent_session = saved_pane
+            .filter(|p| p.runtime_binding.is_none())
+            .and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
@@ -539,7 +560,12 @@ fn restore_tab(
                 enabled: runtime_context.resume_agents_on_restore,
                 resumed_sessions: resumed_agent_sessions,
             };
-            pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
+            pane_restore_startup(
+                saved_agent_session,
+                saved_runtime_binding,
+                saved_history,
+                &mut agent_restore,
+            )
         };
         let restored_agent_session =
             restored_terminal_agent_session(saved_agent_session, startup.duplicate_agent_session);
@@ -572,6 +598,7 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            terminal.restore_runtime_binding(saved_runtime_binding);
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -669,6 +696,7 @@ fn restore_tab(
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
                     }
                 }
+                terminal.restore_runtime_binding(saved_runtime_binding);
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
                 }
@@ -781,9 +809,35 @@ fn restore_tab(
 
 fn pane_restore_startup<'a>(
     session: Option<&PaneAgentSessionSnapshot>,
+    runtime: Option<&crate::api::schema::RuntimeBinding>,
     history: Option<&'a PaneHistorySnapshot>,
     agent_restore: &mut AgentRestoreState<'_>,
 ) -> PaneRestoreStartup<'a> {
+    if let Some(binding) = runtime {
+        // Display attachment wins over inferred Session resume, even when ordinary agent
+        // resume is disabled. This command only attaches a view to existing native work.
+        let plan =
+            binding
+                .attachment
+                .validate()
+                .ok()
+                .map(|_| crate::agent_resume::AgentResumePlan {
+                    agent: binding.attachment.provider.clone(),
+                    argv: binding.attachment.attach_argv.clone(),
+                    dedupe_key: format!("runtime:{}", binding.binding_id),
+                });
+        let duplicate = plan.as_ref().is_some_and(|plan| {
+            !agent_restore
+                .resumed_sessions
+                .insert(plan.dedupe_key.clone())
+        });
+        return PaneRestoreStartup {
+            restore_plan: plan.filter(|_| !duplicate),
+            initial_history_ansi: None,
+            duplicate_agent_session: duplicate,
+            reserved_agent_session: None,
+        };
+    }
     // Native agent resume owns the conversation history. If a pane has a
     // resumable agent session and resume is enabled, do not replay saved pane
     // presentation history into that terminal, even when this pane is a
@@ -1132,7 +1186,8 @@ mod tests {
             resumed_sessions: &mut resumed,
         };
 
-        let startup = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
+        let startup =
+            pane_restore_startup(Some(&session), None, Some(&history), &mut agent_restore);
 
         assert!(startup.restore_plan.is_some());
         assert!(startup.initial_history_ansi.is_none());
@@ -1157,8 +1212,9 @@ mod tests {
             resumed_sessions: &mut resumed,
         };
 
-        let first = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
-        let duplicate = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
+        let first = pane_restore_startup(Some(&session), None, Some(&history), &mut agent_restore);
+        let duplicate =
+            pane_restore_startup(Some(&session), None, Some(&history), &mut agent_restore);
 
         assert!(first.restore_plan.is_some());
         assert!(first.initial_history_ansi.is_none());
@@ -1185,7 +1241,8 @@ mod tests {
             resumed_sessions: &mut resumed,
         };
 
-        let startup = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
+        let startup =
+            pane_restore_startup(Some(&session), None, Some(&history), &mut agent_restore);
 
         assert!(startup.restore_plan.is_none());
         assert_eq!(startup.initial_history_ansi, Some("RESTORED_HISTORY\r\n"));
@@ -1340,6 +1397,7 @@ mod tests {
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
                             }),
+                            runtime_binding: None,
                             launch_argv: None,
                         },
                     )]),
@@ -1354,6 +1412,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            runtime_binding_owners: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1421,6 +1480,7 @@ mod tests {
                                 agent_name: None,
                                 managed_agent_kind: None,
                                 agent_session: None,
+                                runtime_binding: None,
                                 launch_argv: None,
                             },
                         ),
@@ -1432,6 +1492,7 @@ mod tests {
                                 agent_name: None,
                                 managed_agent_kind: None,
                                 agent_session: None,
+                                runtime_binding: None,
                                 launch_argv: None,
                             },
                         ),
@@ -1447,6 +1508,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            runtime_binding_owners: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1485,6 +1547,7 @@ mod tests {
                     agent_name: None,
                     managed_agent_kind: None,
                     agent_session: None,
+                    runtime_binding: None,
                     launch_argv: None,
                 },
             )
@@ -1500,6 +1563,7 @@ mod tests {
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "codex-session".into(),
             }),
+            runtime_binding: None,
             launch_argv: None,
         };
         let snapshot = SessionSnapshot {
@@ -1554,6 +1618,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            runtime_binding_owners: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1651,6 +1716,7 @@ mod tests {
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "codex-session".into(),
                             }),
+                            runtime_binding: None,
                             launch_argv: None,
                         },
                     )]),
@@ -1665,6 +1731,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            runtime_binding_owners: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1854,6 +1921,7 @@ mod tests {
                 agent_name: None,
                 managed_agent_kind: None,
                 agent_session: None,
+                runtime_binding: None,
                 launch_argv: None,
             },
         );
@@ -1902,8 +1970,73 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),
+            runtime_binding_owners: Default::default(),
         };
         history.layout_fingerprint = super::super::snapshot::layout_fingerprint(&snapshot);
         (snapshot, history)
+    }
+    #[test]
+    fn runtime_attachment_restore_uses_exact_native_argv_over_bare_session() {
+        let attachment = crate::api::schema::RuntimeAttachment {
+            provider: "shuvcode".into(),
+            home_id: "home-a".into(),
+            session_id: "ses_exact".into(),
+            location: "/project/exact".into(),
+            host_id: "local".into(),
+            attach_argv: [
+                "/bin/bun",
+                "--no-env-file",
+                "--preload",
+                "/source/preload.js",
+                "/source/index.ts",
+                "supervisor",
+                "attach",
+                "--home",
+                "/native/home",
+                "--home-id",
+                "home-a",
+                "--session",
+                "ses_exact",
+                "--location",
+                "/project/exact",
+            ]
+            .map(String::from)
+            .into(),
+        };
+        let mut binding = crate::api::schema::RuntimeBinding {
+            pane_id: "w1:p1".into(),
+            binding_id: "binding-a".into(),
+            attachment,
+            seq: Some(9),
+            state: crate::api::schema::RuntimeState::Working,
+            label: None,
+            ttl_ms: 30_000,
+            fresh: true,
+        };
+        let session = PaneAgentSessionSnapshot {
+            source: "herdr:shuvcode".into(),
+            agent: "shuvcode".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "ses_wrong".into(),
+        };
+        let mut resumed = HashSet::new();
+        let mut state = AgentRestoreState {
+            enabled: false,
+            resumed_sessions: &mut resumed,
+        };
+        let startup = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
+        assert_eq!(
+            startup.restore_plan.unwrap().argv,
+            binding.attachment.attach_argv
+        );
+        let duplicate = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
+        assert!(duplicate.restore_plan.is_none());
+        binding.attachment.attach_argv.push("--password".into());
+        state.enabled = true;
+        let rejected = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
+        assert!(
+            rejected.restore_plan.is_none(),
+            "invalid exact attachment must not fall back to bare Session resume"
+        );
     }
 }

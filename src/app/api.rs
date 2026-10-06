@@ -9,6 +9,7 @@ mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
 pub(super) mod responses;
+mod runtime_attachment;
 mod session;
 mod tabs;
 mod workspaces;
@@ -668,7 +669,12 @@ impl App {
             .workspaces
             .get(update.ws_idx)
             .and_then(|ws| ws.pane_state(update.pane_id))
-            .map(|pane| pane_agent_status(update.state, pane.seen))
+            .and_then(|pane| {
+                self.state
+                    .terminals
+                    .get(&pane.attached_terminal_id)
+                    .map(|terminal| terminal.runtime_agent_status(pane.seen))
+            })
             .unwrap_or_else(|| pane_agent_status(update.state, update.seen));
 
         if previous_agent_status != agent_status
@@ -1161,6 +1167,18 @@ impl App {
             }
             Method::PaneGraphicsStreamClose(params) => {
                 return self.handle_pane_graphics_stream_close(request.id, params);
+            }
+            Method::PaneBindRuntime(params) => {
+                return self.handle_pane_bind_runtime(request.id, params)
+            }
+            Method::PaneGetRuntime(params) => {
+                return self.handle_pane_get_runtime(request.id, params)
+            }
+            Method::PaneReportRuntime(params) => {
+                return self.handle_pane_report_runtime(request.id, params)
+            }
+            Method::PaneUnbindRuntime(params) => {
+                return self.handle_pane_unbind_runtime(request.id, params)
             }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);

@@ -26,6 +26,8 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub runtime_binding_owners: HashMap<String, crate::api::schema::RuntimeBinding>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,6 +110,8 @@ pub struct PaneSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_binding: Option<crate::api::schema::RuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
 }
 
@@ -186,6 +190,8 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    runtime_binding_owners: HashMap<String, crate::api::schema::RuntimeBinding>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -201,6 +207,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        runtime_binding_owners: raw.runtime_binding_owners,
     })
 }
 
@@ -272,6 +279,7 @@ pub fn capture(
         sidebar_width: None,
         sidebar_section_split: None,
         collapsed_space_keys: std::collections::HashSet::new(),
+        runtime_binding_owners: Default::default(),
     }
 }
 
@@ -370,6 +378,7 @@ fn capture_tab(
                 agent_name,
                 managed_agent_kind,
                 agent_session,
+                runtime_binding: terminal.and_then(|terminal| terminal.runtime_binding.clone()),
                 launch_argv,
             },
         );
@@ -646,6 +655,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            runtime_binding_owners: Default::default(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -688,6 +698,7 @@ mod tests {
                 agent_name: None,
                 managed_agent_kind: None,
                 agent_session: None,
+                runtime_binding: None,
                 launch_argv: None,
             },
         );
@@ -699,6 +710,7 @@ mod tests {
                 agent_name: None,
                 managed_agent_kind: None,
                 agent_session: None,
+                runtime_binding: None,
                 launch_argv: None,
             },
         );
@@ -733,6 +745,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            runtime_binding_owners: Default::default(),
             version: SNAPSHOT_VERSION,
         };
 
@@ -1350,6 +1363,7 @@ mod tests {
                 agent_name: None,
                 managed_agent_kind: None,
                 agent_session: None,
+                runtime_binding: None,
                 launch_argv: None,
             },
         );
@@ -1363,6 +1377,7 @@ mod tests {
                 agent_name: None,
                 managed_agent_kind: None,
                 agent_session: None,
+                runtime_binding: None,
                 launch_argv: None,
             },
         );
@@ -1398,6 +1413,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            runtime_binding_owners: Default::default(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();

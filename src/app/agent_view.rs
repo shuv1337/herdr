@@ -113,6 +113,22 @@ impl AgentViewEntry for AppAgentViewEntry<'_> {
     }
 
     fn status(&self) -> &'static str {
+        if let Some(terminal) = self
+            .app
+            .workspaces
+            .get(self.entry.ws_idx)
+            .and_then(|workspace| workspace.tabs.get(self.entry.tab_idx))
+            .and_then(|tab| tab.panes.get(&self.entry.pane_id))
+            .and_then(|pane| self.app.terminals.get(&pane.attached_terminal_id))
+        {
+            return match terminal.runtime_agent_status(self.entry.seen) {
+                crate::api::schema::AgentStatus::Idle => "idle",
+                crate::api::schema::AgentStatus::Working => "working",
+                crate::api::schema::AgentStatus::Blocked => "blocked",
+                crate::api::schema::AgentStatus::Done => "done",
+                crate::api::schema::AgentStatus::Unknown => "unknown",
+            };
+        }
         status_name(self.entry.state, self.entry.seen)
     }
 
@@ -379,6 +395,71 @@ mod tests {
 
     fn projected_entries(state: &AppState) -> Vec<crate::ui::AgentPanelEntry> {
         crate::ui::agent_panel_entries_from(state, &crate::terminal::TerminalRuntimeRegistry::new())
+    }
+
+    #[test]
+    fn runtime_attachment_done_status_preserves_actual_seen_filter() {
+        let mut state = state_with_agents();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.runtime_binding = Some(crate::api::schema::RuntimeBinding {
+            pane_id: "pane".into(),
+            binding_id: "native".into(),
+            attachment: crate::api::schema::RuntimeAttachment {
+                provider: "shuvcode".into(),
+                home_id: "home".into(),
+                session_id: "ses_done".into(),
+                location: "/tmp".into(),
+                host_id: "local".into(),
+                attach_argv: vec![],
+            },
+            seq: Some(1),
+            state: crate::api::schema::RuntimeState::Done,
+            label: None,
+            ttl_ms: 30_000,
+            fresh: true,
+        });
+        terminal.runtime_observed_at = Some(std::time::Instant::now());
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .seen = true;
+        state.agent_view_override = Some(AgentViewSetParams {
+            source: "native.seen".into(),
+            label: None,
+            filter: Some(AgentViewFilter::All {
+                filters: vec![
+                    AgentViewFilter::Eq {
+                        field: AgentViewField::Builtin(AgentViewBuiltinField::Status),
+                        value: AgentViewValue::String("done".into()),
+                    },
+                    AgentViewFilter::Eq {
+                        field: AgentViewField::Builtin(AgentViewBuiltinField::Seen),
+                        value: AgentViewValue::Bool(true),
+                    },
+                ],
+            }),
+            sort: vec![],
+        });
+        let entries = projected_entries(&state);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].seen);
+        let entry = AppAgentViewEntry {
+            app: &state,
+            entry: &entries[0],
+        };
+        assert_eq!(entry.status(), "done");
+        assert_eq!(entry.attention(), 1);
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .seen = false;
+        assert!(projected_entries(&state).is_empty());
     }
 
     fn current_workspace_view() -> AgentViewSetParams {

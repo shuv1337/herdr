@@ -114,6 +114,11 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    PaneRuntime {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        applied: Option<bool>,
+        binding: Option<crate::api::schema::RuntimeBinding>,
+    },
     PaneInfo {
         pane: PaneInfo,
     },

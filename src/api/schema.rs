@@ -8,6 +8,7 @@ pub mod integrations;
 pub mod panes;
 pub mod plugins;
 pub mod response;
+pub mod runtime;
 pub mod server;
 pub mod session;
 pub mod tabs;
@@ -22,6 +23,7 @@ pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
+pub use runtime::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
@@ -222,6 +224,14 @@ pub enum Method {
     #[serde(skip)]
     #[schemars(skip)]
     PaneGraphicsStreamClose(PaneGraphicsStreamParams),
+    #[serde(rename = "pane.bind_runtime")]
+    PaneBindRuntime(PaneBindRuntimeParams),
+    #[serde(rename = "pane.get_runtime")]
+    PaneGetRuntime(PaneTarget),
+    #[serde(rename = "pane.report_runtime")]
+    PaneReportRuntime(PaneReportRuntimeParams),
+    #[serde(rename = "pane.unbind_runtime")]
+    PaneUnbindRuntime(PaneUnbindRuntimeParams),
     #[serde(rename = "pane.report_agent")]
     PaneReportAgent(PaneReportAgentParams),
     #[serde(rename = "pane.report_agent_session")]

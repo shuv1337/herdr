@@ -11,7 +11,7 @@ pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
 #[cfg(test)]
 pub(crate) use api::test_support::exiting_test_command;
-mod api_helpers;
+pub(crate) mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod creation;
 mod custom_commands;
@@ -375,6 +375,10 @@ impl App {
         let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
             policy.restore_session && snapshot.is_none(),
         )));
+        let runtime_binding_owners = snapshot
+            .as_ref()
+            .map(|snap| snap.runtime_binding_owners.clone())
+            .unwrap_or_default();
         let (workspaces, active, selected) = if let Some(snap) = snapshot {
             let history = config
                 .experimental
@@ -445,6 +449,7 @@ impl App {
         let (theme_palette, theme_name) = resolve_effective_theme(&theme_runtime, None);
 
         let mut state = AppState {
+            runtime_binding_owners,
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
@@ -666,6 +671,7 @@ impl App {
         app.state.workspaces = workspaces;
         app.state.terminals = terminals;
         app.terminal_runtimes = runtimes.into();
+        app.state.runtime_binding_owners = snapshot.runtime_binding_owners.clone();
         app.state.active = snapshot
             .active
             .filter(|&idx| idx < app.state.workspaces.len());

@@ -66,9 +66,12 @@ impl Workspace {
             .iter()
             .flat_map(|tab| tab.panes.values())
             .filter_map(|pane| {
-                terminals
-                    .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
+                terminals.get(&pane.attached_terminal_id).map(|terminal| {
+                    (
+                        terminal.state,
+                        terminal.runtime_presentation_seen(pane.seen),
+                    )
+                })
             })
             .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
             .unwrap_or((AgentState::Unknown, true))

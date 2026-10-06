@@ -721,6 +721,10 @@ fn success_response_round_trips() {
             version: "0.1.2".into(),
             protocol: 6,
             capabilities: Some(ServerCapabilities {
+                runtime_attachment_methods: crate::runtime_attachment::METHODS
+                    .iter()
+                    .map(|method| (*method).into())
+                    .collect(),
                 live_handoff: true,
                 direct_control_yields_to_shell: true,
                 detached_server_daemon: true,

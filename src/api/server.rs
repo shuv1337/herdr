@@ -69,6 +69,10 @@ pub(crate) fn start_server_with_stop_control(
 
 fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
+        runtime_attachment_methods: crate::runtime_attachment::METHODS
+            .iter()
+            .map(|method| (*method).into())
+            .collect(),
         live_handoff: crate::platform::capabilities().live_handoff,
         direct_control_yields_to_shell: true,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
@@ -570,6 +574,10 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneGraphicsStreamDirect(_) => "pane.graphics.stream.direct",
         Method::PaneGraphicsStreamOpen(_) => "pane.graphics.stream.open",
         Method::PaneGraphicsStreamClose(_) => "pane.graphics.stream.close",
+        Method::PaneBindRuntime(_) => "pane.bind_runtime",
+        Method::PaneGetRuntime(_) => "pane.get_runtime",
+        Method::PaneReportRuntime(_) => "pane.report_runtime",
+        Method::PaneUnbindRuntime(_) => "pane.unbind_runtime",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
@@ -1332,6 +1340,10 @@ mod tests {
             },
             &tx,
             Some(ServerCapabilities {
+                runtime_attachment_methods: crate::runtime_attachment::METHODS
+                    .iter()
+                    .map(|method| (*method).into())
+                    .collect(),
                 live_handoff: true,
                 direct_control_yields_to_shell: true,
                 detached_server_daemon: true,

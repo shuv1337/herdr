@@ -812,6 +812,8 @@ pub enum TabBarStatusSegment {
 }
 
 pub struct AppState {
+    pub runtime_binding_owners:
+        std::collections::HashMap<String, crate::api::schema::RuntimeBinding>,
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
     /// Terminal ids whose size is currently owned by a direct attach client.
@@ -1046,6 +1048,7 @@ impl AppState {
     /// Create an AppState for testing — no channels, no PTYs.
     pub fn test_new() -> Self {
         Self {
+            runtime_binding_owners: std::collections::HashMap::new(),
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
