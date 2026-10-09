@@ -21,6 +21,8 @@ pub struct ServerSshAgentRegisterParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_attachment_methods: Vec<String>,
     pub live_handoff: bool,
     /// Direct controllers yield to explicit shell focus/selection and pane input.
     #[serde(default)]

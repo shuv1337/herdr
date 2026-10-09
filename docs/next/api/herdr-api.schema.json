@@ -2438,6 +2438,25 @@
           ],
           "type": "string"
         },
+        "PaneBindRuntimeParams": {
+          "properties": {
+            "attachment": {
+              "$ref": "#/schemas/request/$defs/RuntimeAttachment"
+            },
+            "binding_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "binding_id",
+            "attachment"
+          ],
+          "type": "object"
+        },
         "PaneClearAgentAuthorityParams": {
           "properties": {
             "pane_id": {
@@ -3169,6 +3188,47 @@
           ],
           "type": "object"
         },
+        "PaneReportRuntimeParams": {
+          "properties": {
+            "binding_id": {
+              "type": "string"
+            },
+            "label": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state": {
+              "$ref": "#/schemas/request/$defs/RuntimeState"
+            },
+            "ttl_ms": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id",
+            "binding_id",
+            "seq",
+            "state"
+          ],
+          "type": "object"
+        },
         "PaneResizeParams": {
           "properties": {
             "amount": {
@@ -3423,6 +3483,21 @@
           "required": [
             "start",
             "end"
+          ],
+          "type": "object"
+        },
+        "PaneUnbindRuntimeParams": {
+          "properties": {
+            "binding_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "binding_id"
           ],
           "type": "object"
         },
@@ -3940,6 +4015,51 @@
             "version"
           ],
           "type": "object"
+        },
+        "RuntimeAttachment": {
+          "additionalProperties": false,
+          "properties": {
+            "attach_argv": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "home_id": {
+              "type": "string"
+            },
+            "host_id": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "home_id",
+            "session_id",
+            "location",
+            "host_id",
+            "attach_argv"
+          ],
+          "type": "object"
+        },
+        "RuntimeState": {
+          "enum": [
+            "idle",
+            "working",
+            "blocked",
+            "done",
+            "unknown"
+          ],
+          "type": "string"
         },
         "ServerLiveHandoffParams": {
           "properties": {
@@ -6054,6 +6174,70 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.bind_runtime",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneBindRuntimeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.get_runtime",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.report_runtime",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportRuntimeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.unbind_runtime",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneUnbindRuntimeParams"
             }
           },
           "required": [
@@ -9319,6 +9503,12 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "session_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "pong",
                   "type": "string"
@@ -9670,6 +9860,34 @@
               "required": [
                 "type",
                 "active"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "applied": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "binding": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/RuntimeBinding"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "pane_runtime",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
               ],
               "type": "object"
             },
@@ -10654,6 +10872,98 @@
             }
           ]
         },
+        "RuntimeAttachment": {
+          "additionalProperties": false,
+          "properties": {
+            "attach_argv": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "home_id": {
+              "type": "string"
+            },
+            "host_id": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "home_id",
+            "session_id",
+            "location",
+            "host_id",
+            "attach_argv"
+          ],
+          "type": "object"
+        },
+        "RuntimeBinding": {
+          "properties": {
+            "attachment": {
+              "$ref": "#/schemas/success_response/$defs/RuntimeAttachment"
+            },
+            "binding_id": {
+              "type": "string"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/RuntimeState"
+            },
+            "ttl_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "binding_id",
+            "attachment",
+            "state",
+            "ttl_ms",
+            "fresh"
+          ],
+          "type": "object"
+        },
+        "RuntimeState": {
+          "enum": [
+            "idle",
+            "working",
+            "blocked",
+            "done",
+            "unknown"
+          ],
+          "type": "string"
+        },
         "ServerCapabilities": {
           "properties": {
             "detached_server_daemon": {
@@ -10681,6 +10991,12 @@
             },
             "live_handoff": {
               "type": "boolean"
+            },
+            "runtime_attachment_methods": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "ssh_agent_registration": {
               "default": false,

@@ -1275,6 +1275,30 @@ impl App {
             None
         };
 
+        if let Some(public_id) = self.public_pane_id(target_ws_idx, moved_pane_id) {
+            for owner in self.state.runtime_binding_owners.values_mut() {
+                if owner.pane_id == previous_pane_id {
+                    owner.pane_id = public_id.clone();
+                }
+            }
+            if let Some(terminal_id) = self.state.workspaces[target_ws_idx]
+                .terminal_id(moved_pane_id)
+                .cloned()
+            {
+                if let Some(binding) = self
+                    .state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .and_then(|terminal| terminal.runtime_binding.as_mut())
+                {
+                    // Explicit movement changes the presentation ID of the same physical pane.
+                    binding.pane_id = public_id;
+                    self.state
+                        .runtime_binding_owners
+                        .insert(binding.binding_id.clone(), binding.clone());
+                }
+            }
+        }
         self.state.remove_alias_shadowed_by_new_pane(moved_pane_id);
         self.state.mark_session_dirty();
         self.schedule_session_save();

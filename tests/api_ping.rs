@@ -314,6 +314,7 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["id"], "req_1");
     assert_eq!(value["result"]["type"], "pong");
     assert_eq!(value["result"]["version"], expected_build_version());
+    assert_eq!(value["result"]["session_name"], "default");
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
     assert_eq!(value["result"]["protocol"], 22);
@@ -2621,5 +2622,268 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     assert_eq!(expiry_event["data"]["agent"], "pi");
     assert!(expiry_event["data"]["title"].is_null());
 
+    cleanup_spawned_herdr(child, base);
+}
+
+fn spawn_native_runtime_test(base: &Path) -> (SpawnedHerdr, PathBuf) {
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    fs::create_dir_all(config.join("herdr-dev")).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    fs::write(config.join("herdr-dev/config.toml"), "onboarding = false\n").unwrap();
+    register_runtime_dir(&runtime);
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.env_clear();
+    cmd.args(["--session", "native-runtime-test", "server"]);
+    cmd.env("HOME", base.join("home"));
+    cmd.env("XDG_CONFIG_HOME", &config);
+    cmd.env("XDG_DATA_HOME", base.join("data"));
+    cmd.env("XDG_STATE_HOME", base.join("state"));
+    cmd.env("XDG_CACHE_HOME", base.join("cache"));
+    cmd.env("XDG_RUNTIME_DIR", &runtime);
+    cmd.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", base.join("bin").display()),
+    );
+    cmd.env("SHELL", "/bin/sh");
+    cmd.env("TERM", "xterm-256color");
+    cmd.cwd(base);
+    let child = pair.slave.spawn_command(cmd).unwrap();
+    register_spawned_herdr_pid(child.process_id());
+    (
+        SpawnedHerdr {
+            _master: pair.master,
+            child,
+        },
+        config.join("herdr-dev/sessions/native-runtime-test/herdr.sock"),
+    )
+}
+
+#[test]
+fn native_runtime_attachment_public_json_persists_identity_and_rejects_stale_reports() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let (mut child, socket) = spawn_native_runtime_test(&base);
+    wait_for_socket(&socket, Duration::from_secs(8));
+    let request = |method: &str, params: serde_json::Value| {
+        send_request(
+            &socket,
+            &serde_json::json!({"id":"native", "method":method, "params":params}).to_string(),
+        )
+    };
+    let ping = request("ping", serde_json::json!({}));
+    assert_eq!(ping["result"]["session_name"], "native-runtime-test");
+    for method in [
+        "pane.bind_runtime",
+        "pane.get_runtime",
+        "pane.report_runtime",
+        "pane.unbind_runtime",
+    ] {
+        assert!(ping["result"]["capabilities"]["runtime_attachment_methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == method));
+    }
+    let workspace = request(
+        "workspace.create",
+        serde_json::json!({"cwd":base,"focus":false}),
+    );
+    let pane = workspace["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap();
+    let attachment = serde_json::json!({"provider":"shuvcode", "home_id":"home-a", "session_id":"ses_a", "location":base, "host_id":"local", "attach_argv":["/bin/shuvcode", "supervisor", "attach", "--home",base.join("native-home"), "--home-id","home-a","--session","ses_a","--location",base]});
+    let bind = serde_json::json!({"pane_id":pane,"binding_id":"binding-a","attachment":attachment});
+    assert_eq!(
+        request("pane.bind_runtime", bind.clone())["result"]["applied"],
+        true
+    );
+    assert_eq!(
+        request("pane.bind_runtime", bind.clone())["result"]["applied"],
+        true
+    );
+    let other_workspace = request(
+        "workspace.create",
+        serde_json::json!({"cwd":base,"focus":false}),
+    );
+    let other_pane = &other_workspace["result"]["root_pane"]["pane_id"];
+    let mut collision = bind.clone();
+    collision["pane_id"] = other_pane.clone();
+    assert_eq!(
+        request("pane.bind_runtime", collision)["error"]["code"],
+        "runtime_binding_conflict"
+    );
+    let report = serde_json::json!({"pane_id":pane,"binding_id":"binding-a","seq":9,"state":"working","ttl_ms":50});
+    assert_eq!(
+        request("pane.report_runtime", report.clone())["result"]["applied"],
+        true
+    );
+    assert_eq!(
+        request("pane.report_runtime", report.clone())["result"]["applied"],
+        false
+    );
+    let mut foreign = report.clone();
+    foreign["binding_id"] = "foreign".into();
+    foreign["seq"] = 10.into();
+    assert_eq!(
+        request("pane.report_runtime", foreign)["result"]["applied"],
+        false
+    );
+    request(
+        "pane.report_agent",
+        serde_json::json!({"pane_id":pane,"source":"custom:tui","agent":"pi","state":"blocked","seq":999}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let current = request("pane.get_runtime", serde_json::json!({"pane_id":pane}));
+        if current["result"]["binding"]["state"] == "unknown" {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        request("pane.get", serde_json::json!({"pane_id":pane}))["result"]["pane"]["agent_status"],
+        "unknown"
+    );
+    request("server.stop", serde_json::json!({}));
+    child.child.wait().unwrap();
+    drop(child);
+    let (mut restarted, restarted_socket) = spawn_native_runtime_test(&base);
+    wait_for_socket(&restarted_socket, Duration::from_secs(8));
+    let restored = send_request(
+        &restarted_socket,
+        &serde_json::json!({"id":"restored","method":"pane.get_runtime","params":{"pane_id":pane}})
+            .to_string(),
+    );
+    assert_eq!(restored["result"]["binding"]["seq"], 9);
+    assert_eq!(restored["result"]["binding"]["state"], "unknown");
+    assert_eq!(restored["result"]["binding"]["attachment"], attachment);
+    let stale = send_request(
+        &restarted_socket,
+        &serde_json::json!({"id":"stale","method":"pane.report_runtime","params":report})
+            .to_string(),
+    );
+    assert_eq!(stale["result"]["applied"], false);
+    let snapshot: serde_json::Value = serde_json::from_slice(
+        &fs::read(base.join("config/herdr-dev/sessions/native-runtime-test/session.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot["runtime_binding_owners"]["binding-a"]["pane_id"],
+        pane
+    );
+    send_request(
+        &restarted_socket,
+        r#"{"id":"stop","method":"server.stop","params":{}}"#,
+    );
+    restarted.child.wait().unwrap();
+    cleanup_spawned_herdr(restarted, base);
+}
+
+#[test]
+fn native_runtime_attachment_closed_owner_reserves_identity_after_empty_restart() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let (mut child, socket) = spawn_native_runtime_test(&base);
+    wait_for_socket(&socket, Duration::from_secs(8));
+    let request = |socket: &Path, method: &str, params: serde_json::Value| {
+        send_request(
+            socket,
+            &serde_json::json!({"id":"closed-owner", "method":method, "params":params}).to_string(),
+        )
+    };
+    let workspace = request(
+        &socket,
+        "workspace.create",
+        serde_json::json!({"cwd":base,"focus":false}),
+    );
+    let pane = workspace["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap();
+    let attachment = serde_json::json!({"provider":"shuvcode", "home_id":"home-a", "session_id":"ses_a", "location":base, "host_id":"local", "attach_argv":["/bin/shuvcode", "supervisor", "attach", "--home",base.join("native-home"), "--home-id","home-a","--session","ses_a","--location",base]});
+    let mut bind =
+        serde_json::json!({"pane_id":pane,"binding_id":"closed-binding","attachment":attachment});
+    assert_eq!(
+        request(&socket, "pane.bind_runtime", bind.clone())["result"]["applied"],
+        true
+    );
+    request(&socket, "pane.close", serde_json::json!({"pane_id":pane}));
+    request(&socket, "server.stop", serde_json::json!({}));
+    child.child.wait().unwrap();
+    drop(child);
+    let (mut restarted, socket) = spawn_native_runtime_test(&base);
+    wait_for_socket(&socket, Duration::from_secs(8));
+    let replacement = request(
+        &socket,
+        "workspace.create",
+        serde_json::json!({"cwd":base,"focus":false}),
+    );
+    let replacement_pane = &replacement["result"]["root_pane"]["pane_id"];
+    assert_ne!(replacement_pane, pane);
+    bind["pane_id"] = replacement_pane.clone();
+    assert_eq!(
+        request(&socket, "pane.bind_runtime", bind)["error"]["code"],
+        "runtime_binding_conflict"
+    );
+    request(&socket, "server.stop", serde_json::json!({}));
+    restarted.child.wait().unwrap();
+    cleanup_spawned_herdr(restarted, base);
+}
+
+#[test]
+fn native_runtime_attachment_agent_start_preserves_shuvcode_distribution() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(base.join("bin")).unwrap();
+    for name in ["shuvcode", "opencode"] {
+        let executable = base.join("bin").join(name);
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s' '{name}' > '{}'\nsleep 30\n",
+                base.join("invoked").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (mut child, socket) = spawn_native_runtime_test(&base);
+    wait_for_socket(&socket, Duration::from_secs(8));
+    let request = |method: &str, params: serde_json::Value| {
+        send_request(
+            &socket,
+            &serde_json::json!({"id":"native-start", "method":method, "params":params}).to_string(),
+        )
+    };
+    let workspace = request(
+        "workspace.create",
+        serde_json::json!({"cwd":base,"focus":false}),
+    );
+    let pane = &workspace["result"]["root_pane"]["pane_id"];
+    thread::sleep(Duration::from_millis(500));
+    let started = request(
+        "agent.start",
+        serde_json::json!({"pane_id":pane,"name":"native-test","kind":"Shuvcode"}),
+    );
+    assert_eq!(started["result"]["argv"][0], "shuvcode", "{started}");
+    support::wait_for_file(&base.join("invoked"), Duration::from_secs(3));
+    assert_eq!(
+        fs::read_to_string(base.join("invoked")).unwrap(),
+        "shuvcode"
+    );
+    request("server.stop", serde_json::json!({}));
+    child.child.wait().unwrap();
     cleanup_spawned_herdr(child, base);
 }

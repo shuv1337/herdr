@@ -45,6 +45,8 @@ pub enum ResponseResult {
     Pong {
         version: String,
         protocol: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_name: Option<String>,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
     },
@@ -113,6 +115,11 @@ pub enum ResponseResult {
         source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+    },
+    PaneRuntime {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        applied: Option<bool>,
+        binding: Option<crate::api::schema::RuntimeBinding>,
     },
     PaneInfo {
         pane: PaneInfo,

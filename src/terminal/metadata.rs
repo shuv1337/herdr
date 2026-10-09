@@ -308,6 +308,9 @@ impl TerminalState {
 
     pub fn next_agent_metadata_expiry(&self) -> Option<Instant> {
         let now = Instant::now();
+        let runtime_deadline = self
+            .runtime_expiry()
+            .filter(|_| self.state != AgentState::Unknown);
         self.agent_metadata
             .values()
             .filter(|metadata| self.agent_metadata_matches_guards(metadata))
@@ -320,6 +323,7 @@ impl TerminalState {
                             && self.agent_metadata_expiry(metadata) == Some(*deadline)
                     })
             })
+            .chain(runtime_deadline)
             .min()
     }
 
@@ -347,7 +351,11 @@ impl TerminalState {
         for source in stale_sources {
             self.agent_metadata.remove(&source);
         }
-        if expired_sources.is_empty() {
+        let runtime_expired = self
+            .runtime_expiry()
+            .is_some_and(|deadline| deadline <= now)
+            && self.state != AgentState::Unknown;
+        if expired_sources.is_empty() && !runtime_expired {
             return None;
         }
 
@@ -402,6 +410,16 @@ impl TerminalState {
         presentation.title = self.newest_metadata_title(now, enforce_ttl);
         presentation.display_agent = self.newest_metadata_display_agent(now, enforce_ttl);
         presentation.state_labels = self.effective_metadata_state_labels(now, enforce_ttl);
+        if let Some(binding) = &self.runtime_binding {
+            presentation.state_labels.clear();
+            if self.runtime_state_at(now) != AgentState::Unknown {
+                if let Some(label) = &binding.label {
+                    presentation
+                        .state_labels
+                        .insert(binding.state.label().into(), label.clone());
+                }
+            }
+        }
         presentation
     }
 

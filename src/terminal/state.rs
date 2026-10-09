@@ -131,6 +131,8 @@ pub struct TerminalState {
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
+    pub runtime_binding: Option<crate::api::schema::RuntimeBinding>,
+    pub runtime_observed_at: Option<Instant>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
@@ -169,6 +171,8 @@ impl TerminalState {
             hook_authority: None,
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            runtime_binding: None,
+            runtime_observed_at: None,
             persisted_agent_session: None,
             terminal_title: None,
             manual_label: None,
@@ -689,6 +693,9 @@ impl TerminalState {
         seq: Option<u64>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
+        if self.runtime_binding.is_some() {
+            return None;
+        }
         if crate::detect::session_identity_only_integration(&source, &agent_label) {
             return None;
         }
@@ -1463,6 +1470,9 @@ impl TerminalState {
         seq: Option<u64>,
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
+        if self.runtime_binding.is_some() {
+            return None;
+        }
         let session_ref = session_ref?;
         let known_agent = crate::detect::parse_agent_label(&agent_label);
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
@@ -1897,6 +1907,9 @@ impl TerminalState {
     }
 
     pub fn effective_agent_label(&self) -> Option<&str> {
+        if let Some(binding) = &self.runtime_binding {
+            return Some(&binding.attachment.provider);
+        }
         self.hook_authority
             .as_ref()
             .filter(|authority| self.hook_authority_is_effective(authority))
@@ -2031,6 +2044,12 @@ impl TerminalState {
                 ManagedAgentPhase::Pending { .. } | ManagedAgentPhase::Blocked
             )
         })
+    }
+
+    pub(crate) fn set_managed_agent_distribution_label(&mut self, label: Option<String>) {
+        if let (Some(label), Some(owner)) = (label, self.agent_name_owner.as_mut()) {
+            owner.agent_label = label;
+        }
     }
 
     pub fn managed_agent_interactive_ready(&self) -> bool {
@@ -2241,7 +2260,7 @@ impl TerminalState {
         })
     }
 
-    fn recompute_effective_state(
+    pub(crate) fn recompute_effective_state(
         &mut self,
         previous_agent_label: Option<String>,
         previous_known_agent: Option<Agent>,
@@ -2249,7 +2268,9 @@ impl TerminalState {
         previous_presentation: EffectivePresentation,
         now: Instant,
     ) -> Option<EffectiveStateChange> {
-        let state = if self.visible_blocker_overrides_hook() {
+        let state = if self.runtime_binding.is_some() {
+            self.runtime_state_at(now)
+        } else if self.visible_blocker_overrides_hook() {
             AgentState::Blocked
         } else {
             self.hook_authority
@@ -2362,6 +2383,28 @@ mod tests {
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), true));
         assert_eq!(terminal.agent_name, None);
+    }
+
+    #[test]
+    fn managed_agent_retains_normalized_distribution_name_owner() {
+        let mut terminal = test_terminal();
+        terminal.begin_managed_agent(
+            "native".into(),
+            Agent::OpenCode,
+            Instant::now(),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        terminal.set_managed_agent_distribution_label(crate::detect::distinct_distribution_label(
+            Agent::OpenCode,
+            "Shuvcode",
+        ));
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        assert_eq!(terminal.agent_name.as_deref(), Some("native"));
+        assert_eq!(
+            terminal.agent_name_owner.as_ref().unwrap().agent_label,
+            "shuvcode"
+        );
     }
 
     #[test]

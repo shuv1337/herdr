@@ -213,7 +213,12 @@ impl App {
                 self.state
                     .terminals
                     .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
+                    .map(|terminal| {
+                        (
+                            terminal.state,
+                            terminal.runtime_presentation_seen(pane.seen),
+                        )
+                    })
             })
             .max_by_key(|(state, seen)| tab_attention_priority(*state, *seen))
             .unwrap_or((crate::detect::AgentState::Unknown, true));
@@ -347,7 +352,7 @@ impl App {
             terminal_title: terminal.terminal_title.clone(),
             terminal_title_stripped: terminal.terminal_title_stripped(),
             display_agent: presentation.display_agent,
-            agent_status: pane_agent_status(terminal.state, pane.seen),
+            agent_status: terminal.runtime_agent_status(pane.seen),
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
@@ -407,6 +412,14 @@ impl App {
 fn terminal_agent_session_info(
     terminal: &crate::terminal::TerminalState,
 ) -> Option<crate::api::schema::AgentSessionInfo> {
+    if let Some(binding) = &terminal.runtime_binding {
+        return Some(crate::api::schema::AgentSessionInfo {
+            source: "herdr:shuvcode".into(),
+            agent: binding.attachment.provider.clone(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: binding.attachment.session_id.clone(),
+        });
+    }
     if let Some(authority) = terminal.hook_authority.as_ref() {
         if let Some(session_ref) = authority.session_ref.as_ref() {
             return Some(crate::api::schema::AgentSessionInfo {

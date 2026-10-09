@@ -720,7 +720,12 @@ fn success_response_round_trips() {
         result: ResponseResult::Pong {
             version: "0.1.2".into(),
             protocol: 6,
+            session_name: Some("native-test".into()),
             capabilities: Some(ServerCapabilities {
+                runtime_attachment_methods: crate::runtime_attachment::METHODS
+                    .iter()
+                    .map(|method| (*method).into())
+                    .collect(),
                 live_handoff: true,
                 direct_control_yields_to_shell: true,
                 detached_server_daemon: true,
@@ -1459,4 +1464,21 @@ fn pane_link_resolve_round_trips() {
         serde_json::from_value::<ResponseResult>(json).unwrap(),
         result
     );
+}
+
+#[test]
+fn legacy_ping_response_omits_optional_peer_session_identity() {
+    let response: SuccessResponse = serde_json::from_str(
+        r#"{"id":"legacy","result":{"type":"pong","version":"0.1.2","protocol":22}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        &response.result,
+        ResponseResult::Pong {
+            session_name: None,
+            ..
+        }
+    ));
+    let json = serde_json::to_value(response).unwrap();
+    assert!(json["result"].get("session_name").is_none());
 }
