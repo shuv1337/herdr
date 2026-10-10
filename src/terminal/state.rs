@@ -133,6 +133,8 @@ pub struct TerminalState {
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub runtime_binding: Option<crate::api::schema::RuntimeBinding>,
     pub runtime_observed_at: Option<Instant>,
+    /// A cold restore reset a persisted runtime `Done`; a repeated `Done` is not a new completion.
+    pub runtime_restored_done: bool,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
@@ -173,6 +175,7 @@ impl TerminalState {
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             runtime_binding: None,
             runtime_observed_at: None,
+            runtime_restored_done: false,
             persisted_agent_session: None,
             terminal_title: None,
             manual_label: None,

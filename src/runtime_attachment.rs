@@ -214,6 +214,7 @@ impl TerminalState {
         }
         self.runtime_binding = binding;
         self.runtime_observed_at = observed_at;
+        self.runtime_restored_done = false;
         TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous.agent_label,
@@ -229,7 +230,8 @@ impl TerminalState {
 
     // Imported panes keep the same attach process, so a snapshot captured while
     // fresh carries its last report with a new TTL from restore time. A relaunched
-    // attach process must report again before its state is trusted.
+    // attach process must report again before its state is trusted. A reset Done
+    // is remembered so the relaunched reporter's first Done does not replay it.
     pub(crate) fn restore_runtime_binding(
         &mut self,
         binding: Option<&RuntimeBinding>,
@@ -239,6 +241,8 @@ impl TerminalState {
         let carried = mode == RuntimeBindingRestore::Imported
             && binding
                 .is_some_and(|binding| binding.fresh && binding.state != RuntimeState::Unknown);
+        self.runtime_restored_done =
+            !carried && binding.is_some_and(|binding| binding.state == RuntimeState::Done);
         self.runtime_binding = binding.cloned().map(|mut binding| {
             if !carried {
                 binding.state = RuntimeState::Unknown;
