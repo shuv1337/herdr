@@ -1416,6 +1416,101 @@ fn live_handoff_accepts_canonical_pane_id_from_child_env() {
 }
 
 #[test]
+fn live_handoff_keeps_fresh_runtime_binding_state() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let attachment = serde_json::json!({
+        "provider": "shuvcode",
+        "home_id": "home-a",
+        "session_id": "ses_a",
+        "location": "/tmp",
+        "host_id": "local",
+        "attach_argv": [
+            "/bin/shuvcode", "supervisor", "attach",
+            "--home", "/tmp/native-home",
+            "--home-id", "home-a",
+            "--session", "ses_a",
+            "--location", "/tmp"
+        ]
+    });
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:bind",
+            "method": "pane.bind_runtime",
+            "params": {"pane_id": pane_id, "binding_id": "binding-a", "attachment": attachment}
+        }),
+    ));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:report",
+            "method": "pane.report_runtime",
+            "params": {
+                "pane_id": pane_id,
+                "binding_id": "binding-a",
+                "seq": 1,
+                "state": "working",
+                "label": "compiling",
+                "ttl_ms": 600000
+            }
+        }),
+    ));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let runtime = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:get-runtime",
+            "method": "pane.get_runtime",
+            "params": {"pane_id": pane_id}
+        }),
+    );
+    let binding = &runtime["result"]["binding"];
+    assert_eq!(binding["state"], "working", "{runtime}");
+    assert_eq!(binding["label"], "compiling", "{runtime}");
+    assert_eq!(binding["fresh"], true, "{runtime}");
+    assert_eq!(binding["seq"], 1, "{runtime}");
+    let pane = request(
+        &api_socket,
+        serde_json::json!({"id":"test:pane-get","method":"pane.get","params":{"pane_id":pane_id}}),
+    );
+    assert_eq!(pane["result"]["pane"]["agent_status"], "working", "{pane}");
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     use std::os::unix::fs::PermissionsExt;
 

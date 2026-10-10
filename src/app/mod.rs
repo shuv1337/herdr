@@ -672,6 +672,7 @@ impl App {
         app.state.terminals = terminals;
         app.terminal_runtimes = runtimes.into();
         app.state.runtime_binding_owners = snapshot.runtime_binding_owners.clone();
+        app.sync_agent_metadata_deadline();
         app.state.active = snapshot
             .active
             .filter(|&idx| idx < app.state.workspaces.len());
