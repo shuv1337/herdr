@@ -2791,7 +2791,7 @@ fn native_runtime_attachment_public_json_persists_identity_and_rejects_stale_rep
 }
 
 #[test]
-fn native_runtime_attachment_closed_owner_reserves_identity_after_empty_restart() {
+fn native_runtime_attachment_closed_owner_is_released_after_empty_restart() {
     let _lock = test_lock();
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
@@ -2830,12 +2830,11 @@ fn native_runtime_attachment_closed_owner_reserves_identity_after_empty_restart(
         serde_json::json!({"cwd":base,"focus":false}),
     );
     let replacement_pane = &replacement["result"]["root_pane"]["pane_id"];
-    assert_ne!(replacement_pane, pane);
     bind["pane_id"] = replacement_pane.clone();
-    assert_eq!(
-        request(&socket, "pane.bind_runtime", bind)["error"]["code"],
-        "runtime_binding_conflict"
-    );
+    let rebound = request(&socket, "pane.bind_runtime", bind);
+    assert_eq!(rebound["result"]["applied"], true, "{rebound}");
+    assert_eq!(rebound["result"]["binding"]["pane_id"], *replacement_pane);
+    assert!(rebound["result"]["binding"]["seq"].is_null());
     request(&socket, "server.stop", serde_json::json!({}));
     restarted.child.wait().unwrap();
     cleanup_spawned_herdr(restarted, base);

@@ -269,7 +269,8 @@ fn restore_with_imports_and_failures(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
-    // Closed attachment owners still reserve public identity after an empty restart.
+    // Saved attachment owners reserve their public identity even when their pane fails
+    // to restore, so a later pane never reuses an ID a pre-restore client may hold.
     crate::workspace::reserve_public_workspace_ids(
         snapshot
             .runtime_binding_owners
@@ -1561,6 +1562,114 @@ mod tests {
         assert_eq!(workspace.next_public_pane_number, 4);
         assert_eq!(workspace.tabs[0].number, 5);
         assert_eq!(workspace.next_public_tab_number, 6);
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_live_runtime_binding_owners_and_reserves_their_identity() {
+        let cwd = std::env::current_dir().unwrap();
+        let owner = |binding_id: &str, pane_id: &str| {
+            (
+                binding_id.to_string(),
+                crate::api::schema::RuntimeBinding {
+                    pane_id: pane_id.into(),
+                    binding_id: binding_id.into(),
+                    attachment: crate::api::schema::RuntimeAttachment {
+                        provider: "shuvcode".into(),
+                        home_id: "home-a".into(),
+                        session_id: binding_id.into(),
+                        location: cwd.display().to_string(),
+                        host_id: "local".into(),
+                        attach_argv: vec!["shuvcode".into()],
+                    },
+                    seq: Some(7),
+                    state: crate::api::schema::RuntimeState::Unknown,
+                    label: None,
+                    ttl_ms: crate::runtime_attachment::DEFAULT_TTL_MS,
+                    fresh: false,
+                },
+            )
+        };
+        let live_workspace = format!("w{}", crate::workspace::encode_public_number(40));
+        let closed_workspace = format!("w{}", crate::workspace::encode_public_number(41));
+        let live_pane = crate::workspace::public_pane_id_for_number(&live_workspace, 1);
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some(live_workspace.clone()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::from([(0, 1)]),
+                next_public_pane_number: 2,
+                public_tab_numbers: vec![1],
+                next_public_tab_number: 2,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: cwd.clone(),
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            runtime_binding: None,
+                            launch_argv: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            runtime_binding_owners: HashMap::from([
+                owner("live-binding", &live_pane),
+                owner(
+                    "legacy-tombstone",
+                    &crate::workspace::public_pane_id_for_number(&closed_workspace, 1),
+                ),
+            ]),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let next = crate::workspace::generate_workspace_id();
+        assert!(
+            crate::workspace::public_workspace_number(&next).is_some_and(|number| number > 41),
+            "restored owner identities must stay reserved, got {next}"
+        );
+        let mut state = crate::app::AppState::test_new();
+        state.workspaces = workspaces;
+        state.terminals = terminals;
+        state.active = Some(0);
+        state.runtime_binding_owners = snapshot.runtime_binding_owners.clone();
+        assert!(state.prune_runtime_binding_owners());
+        assert_eq!(
+            state.runtime_binding_owners.keys().collect::<Vec<_>>(),
+            vec!["live-binding"]
+        );
+        assert_eq!(state.runtime_binding_owners["live-binding"].seq, Some(7));
+        state.assert_invariants_for_test();
     }
 
     #[tokio::test]
