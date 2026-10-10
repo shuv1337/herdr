@@ -13,11 +13,43 @@ pub(crate) const METHODS: &[&str] = &[
 ];
 pub(crate) const DEFAULT_TTL_MS: u64 = 30_000;
 
+// Basenames restore may launch from a persisted attach prefix. Executables may carry an
+// `.exe` extension; script entrypoints and preloads must match exactly.
+const ATTACH_EXECUTABLES: &[&str] = &["shuvcode"];
+const ATTACH_SCRIPT_RUNTIMES: &[&str] = &["bun"];
+const ATTACH_ENTRYPOINTS: &[&str] = &["index.ts", "index.js"];
+const ATTACH_PRELOADS: &[&str] = &["preload.ts", "preload.js"];
+
+fn allowed_executable(value: &str, allowed: &[&str]) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        && path
+            .extension()
+            .is_none_or(|extension| extension.eq_ignore_ascii_case("exe"))
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| allowed.contains(&stem))
+}
+
+fn allowed_script(value: &str, allowed: &[&str]) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| allowed.contains(&name))
+}
+
 impl RuntimeAttachment {
     // Only the read-only native attachment entrypoint may be persisted for restore.
     // The local command API already grants terminal input authority. This validates
     // the trusted caller's attach descriptor shape, not executable/script contents.
     // Source and compiled commands remain caller-owned; credential flags are excluded.
+    // A persisted argv runs at the next session load, after the caller is gone and
+    // regardless of the agent resume opt-out, so every prefix path must also carry a
+    // known shuvcode executable, script runtime, entrypoint, or preload basename. This
+    // bounds what restore launches to shuvcode-shaped commands rather than any binary.
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if self.provider != "shuvcode"
             || [
@@ -45,22 +77,25 @@ impl RuntimeAttachment {
             return Err("restore requires exact supervisor attach argv");
         };
         let prefix = &self.attach_argv[..at];
-        let absolute = |value: &String| Path::new(value).is_absolute();
+        let runtime = |value: &String| allowed_executable(value, ATTACH_SCRIPT_RUNTIMES);
+        let entrypoint = |value: &String| allowed_script(value, ATTACH_ENTRYPOINTS);
         let valid_prefix = match prefix {
-            [executable] => absolute(executable),
-            [bun, entrypoint] => absolute(bun) && absolute(entrypoint),
-            [bun, no_env, preload_flag, preload, entrypoint] => {
-                absolute(bun)
+            [executable] => allowed_executable(executable, ATTACH_EXECUTABLES),
+            [bun, script] => runtime(bun) && entrypoint(script),
+            [bun, no_env, preload_flag, preload, script] => {
+                runtime(bun)
                     && no_env == "--no-env-file"
                     && preload_flag == "--preload"
-                    && absolute(preload)
-                    && absolute(entrypoint)
+                    && allowed_script(preload, ATTACH_PRELOADS)
+                    && entrypoint(script)
             }
             _ => false,
         };
+        if !valid_prefix {
+            return Err("restore requires an allowlisted shuvcode attach executable");
+        }
         let suffix = &self.attach_argv[at + 2..];
-        if !valid_prefix
-            || suffix.len() != 8
+        if suffix.len() != 8
             || suffix[0] != "--home"
             || !Path::new(&suffix[1]).is_absolute()
             || suffix[2] != "--home-id"

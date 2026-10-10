@@ -452,6 +452,72 @@ mod tests {
         changed.session_id = "ses_b".into();
         assert!(changed.validate().is_err());
     }
+
+    fn with_prefix(prefix: &[String]) -> RuntimeAttachment {
+        let mut attachment = attachment();
+        attachment.attach_argv.splice(..1, prefix.iter().cloned());
+        attachment
+    }
+
+    const PREFIX_REJECTED: &str = "restore requires an allowlisted shuvcode attach executable";
+
+    #[test]
+    fn runtime_attachment_accepts_allowlisted_attach_prefixes() {
+        let root = std::env::temp_dir();
+        let path = |name: &str| root.join(name).display().to_string();
+        for prefix in [
+            vec![path("shuvcode")],
+            vec![path("shuvcode.exe")],
+            vec![path("shuvcode.EXE")],
+            vec![path("bun"), path("index.ts")],
+            vec![path("bun.exe"), path("index.js")],
+            vec![
+                path("bun"),
+                "--no-env-file".into(),
+                "--preload".into(),
+                path("preload.js"),
+                path("index.ts"),
+            ],
+        ] {
+            assert_eq!(with_prefix(&prefix).validate(), Ok(()), "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_attachment_rejects_non_allowlisted_attach_prefixes() {
+        let root = std::env::temp_dir();
+        let path = |name: &str| root.join(name).display().to_string();
+        for prefix in [
+            vec!["/usr/bin/env".to_string()],
+            vec!["/bin/sh".to_string()],
+            vec![path("shuvcode.sh")],
+            vec![path("shuvcode-evil")],
+            vec!["shuvcode".to_string()],
+            vec![path("node"), path("index.ts")],
+            vec![path("bun"), path("payload.ts")],
+            vec![path("bun"), path("shuvcode")],
+            vec![
+                path("bun"),
+                "--no-env-file".into(),
+                "--preload".into(),
+                path("payload.js"),
+                path("index.ts"),
+            ],
+            vec![
+                path("bun"),
+                "--no-env-file".into(),
+                "--preload".into(),
+                path("preload.js"),
+                path("payload.ts"),
+            ],
+        ] {
+            assert_eq!(
+                with_prefix(&prefix).validate(),
+                Err(PREFIX_REJECTED),
+                "{prefix:?}"
+            );
+        }
+    }
     #[test]
     fn runtime_attachment_done_heartbeats_preserve_completion_sequence() {
         let mut app = app();
