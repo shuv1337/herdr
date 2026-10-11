@@ -144,7 +144,14 @@ impl App {
                 },
             );
         };
+        let now = Instant::now();
         let previous_runtime_state = binding.state;
+        // An expired Done is a new completion; a Done reset by cold restore is not.
+        let previous_runtime_done = terminal.runtime_restored_done
+            || (previous_runtime_state == RuntimeState::Done
+                && terminal
+                    .runtime_expiry()
+                    .is_some_and(|deadline| now < deadline));
         let previous_detect_state = terminal.state;
         binding.seq = Some(params.seq);
         binding.state = params.state;
@@ -154,27 +161,41 @@ impl App {
         self.state
             .runtime_binding_owners
             .insert(binding.binding_id.clone(), binding.clone());
-        let now = Instant::now();
         let update = self.state.update_terminal_state(pane_id, |terminal| {
             Some(terminal.mutate_runtime_binding(Some(binding.clone()), Some(now)))
         });
         let same_detect_transition = previous_runtime_state != binding.state
             && previous_detect_state == binding.state.detect();
-        if same_detect_transition {
-            self.state.next_agent_state_change_seq += 1;
+        let detect_changed = update
+            .as_ref()
+            .is_some_and(|update| update.previous_state != update.state);
+        // Working/Blocked -> Done already completes through the generic Idle edge.
+        let generic_completion = update.as_ref().is_some_and(|update| {
+            update.state == crate::detect::AgentState::Idle
+                && matches!(
+                    update.previous_state,
+                    crate::detect::AgentState::Working | crate::detect::AgentState::Blocked
+                )
+        });
+        let runtime_completion =
+            binding.state == RuntimeState::Done && !previous_runtime_done && !generic_completion;
+        if same_detect_transition || runtime_completion {
+            if !detect_changed {
+                self.state.next_agent_state_change_seq += 1;
+            }
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.last_agent_state_change_seq = Some(self.state.next_agent_state_change_seq);
-                terminal.last_agent_completion_seq = (binding.state == RuntimeState::Done)
-                    .then_some(self.state.next_agent_state_change_seq);
+                terminal.last_agent_completion_seq =
+                    runtime_completion.then_some(self.state.next_agent_state_change_seq);
             }
-            if binding.state == RuntimeState::Done {
+            if runtime_completion {
                 self.state.publish_runtime_completion(ws_idx, pane_id);
             }
         }
         if let Some(update) = &update {
             self.emit_pane_state_update(update);
         }
-        if same_detect_transition && update.is_none() {
+        if (same_detect_transition || runtime_completion) && update.is_none() {
             if let Some(pane) = self.pane_info(ws_idx, pane_id) {
                 self.emit_event(crate::api::schema::EventEnvelope {
                     event: crate::api::schema::EventKind::PaneAgentStatusChanged,
@@ -576,8 +597,20 @@ mod tests {
         app.state.assert_invariants_for_test();
     }
 
-    #[test]
-    fn runtime_attachment_restored_or_expired_done_does_not_replay_notifications() {
+    fn status_change_events(app: &App) -> usize {
+        app.event_hub
+            .events_after(0)
+            .iter()
+            .filter(|(_, envelope)| {
+                matches!(
+                    envelope.event,
+                    crate::api::schema::EventKind::PaneAgentStatusChanged
+                )
+            })
+            .count()
+    }
+
+    fn bound_unfocused_app() -> (App, String) {
         let mut app = app();
         app.state.outer_terminal_focus = Some(false);
         app.state.toast_config.delay_seconds = 1;
@@ -592,27 +625,211 @@ mod tests {
                 attachment: attachment(),
             },
         );
+        (app, pane_id)
+    }
+
+    fn report(pane_id: &str, seq: u64, state: RuntimeState) -> PaneReportRuntimeParams {
+        PaneReportRuntimeParams {
+            pane_id: pane_id.into(),
+            binding_id: "binding-a".into(),
+            seq,
+            state,
+            label: None,
+            ttl_ms: None,
+        }
+    }
+
+    // Reports a Done edge and asserts it produced exactly one completion.
+    fn assert_single_done_completion(app: &mut App, pane_id: &str, seq: u64) {
+        let (_, raw, terminal_id) = app.runtime_binding_target(pane_id).unwrap();
+        app.state.pending_agent_notifications.clear();
+        let change_seq = app.state.next_agent_state_change_seq;
+        let events = status_change_events(app);
+        assert!(app
+            .handle_pane_report_runtime("done".into(), report(pane_id, seq, RuntimeState::Done))
+            .contains("\"applied\":true"));
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(app.state.next_agent_state_change_seq, change_seq + 1);
+        assert_eq!(
+            terminal.last_agent_completion_seq,
+            Some(app.state.next_agent_state_change_seq)
+        );
+        assert_eq!(
+            terminal.last_agent_state_change_seq,
+            terminal.last_agent_completion_seq
+        );
+        assert_eq!(app.state.pending_agent_notifications.len(), 1);
+        assert_eq!(
+            app.state.pending_agent_notifications[&raw].kind,
+            crate::app::state::ToastKind::Finished
+        );
+        assert!(!app.state.workspaces[0].pane_state(raw).unwrap().seen);
+        assert_eq!(status_change_events(app), events + 1);
+        assert_eq!(
+            app.pane_info(0, raw).unwrap().agent_status,
+            crate::api::schema::AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn runtime_attachment_unknown_to_done_publishes_completion() {
+        let (mut app, pane_id) = bound_unfocused_app();
         let (_, raw, terminal_id) = app.runtime_binding_target(&pane_id).unwrap();
-        for seq in [1, 2] {
+        assert_eq!(
+            app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Unknown
+        );
+        assert_single_done_completion(&mut app, &pane_id, 1);
+
+        let completion = app.state.terminals[&terminal_id].last_agent_completion_seq;
+        let deadline = app.state.pending_agent_notifications[&raw].deadline;
+        let events = status_change_events(&app);
+        app.handle_pane_report_runtime("heartbeat".into(), report(&pane_id, 2, RuntimeState::Done));
+        assert_eq!(
+            app.state.terminals[&terminal_id].last_agent_completion_seq,
+            completion
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].last_agent_state_change_seq,
+            completion
+        );
+        assert_eq!(
+            app.state.pending_agent_notifications[&raw].deadline,
+            deadline
+        );
+        assert_eq!(status_change_events(&app), events);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn runtime_attachment_idle_to_done_publishes_completion() {
+        let (mut app, pane_id) = bound_unfocused_app();
+        app.handle_pane_report_runtime("idle".into(), report(&pane_id, 1, RuntimeState::Idle));
+        assert_single_done_completion(&mut app, &pane_id, 2);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn runtime_attachment_working_to_done_publishes_one_completion() {
+        let (mut app, pane_id) = bound_unfocused_app();
+        app.handle_pane_report_runtime(
+            "working".into(),
+            report(&pane_id, 1, RuntimeState::Working),
+        );
+        let (_, _, terminal_id) = app.runtime_binding_target(&pane_id).unwrap();
+        assert_eq!(
+            app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Working
+        );
+        assert_single_done_completion(&mut app, &pane_id, 2);
+        app.state.assert_invariants_for_test();
+    }
+
+    fn expire_runtime_observation(app: &mut App, terminal_id: &TerminalId) {
+        let now = Instant::now();
+        let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
+        terminal.runtime_observed_at =
+            Some(now - std::time::Duration::from_millis(crate::runtime_attachment::DEFAULT_TTL_MS));
+        app.state.expire_agent_metadata_at(now, now);
+        assert_eq!(
+            app.state.terminals[terminal_id].state,
+            crate::detect::AgentState::Unknown
+        );
+    }
+
+    // Mirrors session capture followed by a cold restore that relaunches attach.
+    fn cold_restore(app: &mut App, terminal_id: &TerminalId) {
+        let now = Instant::now();
+        let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
+        let saved = terminal.runtime_binding_snapshot(now);
+        terminal.restore_runtime_binding(
+            saved.as_ref(),
+            crate::runtime_attachment::RuntimeBindingRestore::Relaunched,
+            now,
+        );
+        assert_eq!(terminal.state, crate::detect::AgentState::Unknown);
+    }
+
+    #[test]
+    fn runtime_attachment_expired_then_done_publishes_completion() {
+        let (mut app, pane_id) = bound_unfocused_app();
+        let (_, _, terminal_id) = app.runtime_binding_target(&pane_id).unwrap();
+        app.handle_pane_report_runtime(
+            "working".into(),
+            report(&pane_id, 1, RuntimeState::Working),
+        );
+        expire_runtime_observation(&mut app, &terminal_id);
+        assert_single_done_completion(&mut app, &pane_id, 2);
+
+        // An expired Done is treated like any silent reporter: its next Done completes.
+        expire_runtime_observation(&mut app, &terminal_id);
+        assert_single_done_completion(&mut app, &pane_id, 3);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn runtime_attachment_restored_done_does_not_replay_notifications() {
+        let (mut app, pane_id) = bound_unfocused_app();
+        let (_, raw, terminal_id) = app.runtime_binding_target(&pane_id).unwrap();
+        assert_single_done_completion(&mut app, &pane_id, 1);
+        cold_restore(&mut app, &terminal_id);
+        app.state.pending_agent_notifications.clear();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .last_agent_completion_seq = None;
+
+        for seq in [2, 3] {
+            let change_seq = app.state.next_agent_state_change_seq;
             app.handle_pane_report_runtime(
                 "done".into(),
-                PaneReportRuntimeParams {
-                    pane_id: pane_id.clone(),
-                    binding_id: "binding-a".into(),
-                    seq,
-                    state: RuntimeState::Done,
-                    label: None,
-                    ttl_ms: None,
-                },
+                report(&pane_id, seq, RuntimeState::Done),
             );
+            let terminal = &app.state.terminals[&terminal_id];
             assert!(app.state.pending_agent_notifications.is_empty());
+            assert_eq!(terminal.last_agent_completion_seq, None);
+            assert_eq!(terminal.state, crate::detect::AgentState::Idle);
+            if seq == 2 {
+                assert_eq!(app.state.next_agent_state_change_seq, change_seq + 1);
+                assert_eq!(
+                    terminal.last_agent_state_change_seq,
+                    Some(app.state.next_agent_state_change_seq)
+                );
+            } else {
+                assert_eq!(app.state.next_agent_state_change_seq, change_seq);
+            }
             assert_eq!(
                 app.pane_info(0, raw).unwrap().agent_status,
                 crate::api::schema::AgentStatus::Done
             );
-            app.state.terminals.get_mut(&terminal_id).unwrap().state =
-                crate::detect::AgentState::Unknown;
         }
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn runtime_attachment_restored_working_then_done_publishes_completion() {
+        let (mut app, pane_id) = bound_unfocused_app();
+        let (_, _, terminal_id) = app.runtime_binding_target(&pane_id).unwrap();
+        app.handle_pane_report_runtime(
+            "working".into(),
+            report(&pane_id, 1, RuntimeState::Working),
+        );
+        cold_restore(&mut app, &terminal_id);
+        assert_single_done_completion(&mut app, &pane_id, 2);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn runtime_attachment_done_stale_at_save_publishes_completion_after_restore() {
+        let (mut app, pane_id) = bound_unfocused_app();
+        let (_, _, terminal_id) = app.runtime_binding_target(&pane_id).unwrap();
+        assert_single_done_completion(&mut app, &pane_id, 1);
+        expire_runtime_observation(&mut app, &terminal_id);
+        cold_restore(&mut app, &terminal_id);
+        assert!(!app.state.terminals[&terminal_id].runtime_restored_done);
+        assert_single_done_completion(&mut app, &pane_id, 2);
+        app.state.assert_invariants_for_test();
     }
 
     #[test]
