@@ -378,7 +378,9 @@ fn capture_tab(
                 agent_name,
                 managed_agent_kind,
                 agent_session,
-                runtime_binding: terminal.and_then(|terminal| terminal.runtime_binding.clone()),
+                runtime_binding: terminal.and_then(|terminal| {
+                    terminal.runtime_binding_snapshot(std::time::Instant::now())
+                }),
                 launch_argv,
             },
         );
@@ -584,6 +586,55 @@ mod tests {
             LayoutSnapshot::Split { ratio, .. } => Some(*ratio),
             LayoutSnapshot::Pane(_) => None,
         }
+    }
+
+    #[test]
+    fn runtime_binding_capture_keeps_live_state_and_erases_stale_state() {
+        let mut state = state_with_workspaces(&["runtime-binding-snapshot"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let binding = crate::api::schema::RuntimeBinding {
+            pane_id: "w1:p1".into(),
+            binding_id: "binding-a".into(),
+            attachment: crate::api::schema::RuntimeAttachment {
+                provider: "shuvcode".into(),
+                home_id: "home".into(),
+                session_id: "ses_a".into(),
+                location: "/tmp".into(),
+                host_id: "local".into(),
+                attach_argv: vec![],
+            },
+            seq: Some(3),
+            state: crate::api::schema::RuntimeState::Working,
+            label: Some("compiling".into()),
+            ttl_ms: 60_000,
+            fresh: true,
+        };
+        let captured_binding = |state: &AppState| {
+            capture_from_state(state).workspaces[0].tabs[0].panes[&root.raw()]
+                .runtime_binding
+                .clone()
+                .unwrap()
+        };
+
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        let _ = terminal.mutate_runtime_binding(Some(binding), Some(std::time::Instant::now()));
+        let live = captured_binding(&state);
+        assert!(live.fresh);
+        assert_eq!(live.state, crate::api::schema::RuntimeState::Working);
+        assert_eq!(live.label.as_deref(), Some("compiling"));
+
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.runtime_observed_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(120));
+        assert!(terminal.runtime_observed_at.is_some());
+        let stale = captured_binding(&state);
+        assert!(!stale.fresh);
+        assert_eq!(stale.state, crate::api::schema::RuntimeState::Unknown);
+        assert_eq!(stale.label, None);
+        assert_eq!(stale.seq, Some(3));
     }
 
     #[test]

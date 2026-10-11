@@ -431,7 +431,11 @@ mod tests {
         assert!(!current.fresh);
         assert_eq!(current.state, RuntimeState::Unknown);
         let saved = terminal.runtime_binding.clone();
-        terminal.restore_runtime_binding(saved.as_ref());
+        terminal.restore_runtime_binding(
+            saved.as_ref(),
+            crate::runtime_attachment::RuntimeBindingRestore::Relaunched,
+            Instant::now(),
+        );
         assert_eq!(terminal.runtime_binding.as_ref().unwrap().seq, Some(1));
         assert_eq!(
             terminal.runtime_agent_status(false),

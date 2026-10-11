@@ -227,16 +227,177 @@ impl TerminalState {
         }
     }
 
-    pub(crate) fn restore_runtime_binding(&mut self, binding: Option<&RuntimeBinding>) {
+    // Imported panes keep the same attach process, so a snapshot captured while
+    // fresh carries its last report with a new TTL from restore time. A relaunched
+    // attach process must report again before its state is trusted.
+    pub(crate) fn restore_runtime_binding(
+        &mut self,
+        binding: Option<&RuntimeBinding>,
+        mode: RuntimeBindingRestore,
+        now: Instant,
+    ) {
+        let carried = mode == RuntimeBindingRestore::Imported
+            && binding
+                .is_some_and(|binding| binding.fresh && binding.state != RuntimeState::Unknown);
         self.runtime_binding = binding.cloned().map(|mut binding| {
-            binding.state = RuntimeState::Unknown;
-            binding.label = None;
-            binding.fresh = false;
+            if !carried {
+                binding.state = RuntimeState::Unknown;
+                binding.label = None;
+                binding.fresh = false;
+            }
             binding
         });
-        self.runtime_observed_at = None;
-        if self.runtime_binding.is_some() {
-            self.state = AgentState::Unknown;
+        self.runtime_observed_at = carried.then_some(now);
+        if let Some(binding) = &self.runtime_binding {
+            self.state = binding.state.detect();
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeBindingRestore {
+    /// The pane's PTY was imported from a live server handoff; no attach relaunch.
+    Imported,
+    /// The attach command is relaunched (cold restore) or the pane is unavailable.
+    Relaunched,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::schema::AgentStatus;
+    use crate::terminal::TerminalId;
+
+    fn binding(state: RuntimeState, label: Option<&str>, fresh: bool) -> RuntimeBinding {
+        RuntimeBinding {
+            pane_id: "w1:p1".into(),
+            binding_id: "binding-a".into(),
+            attachment: RuntimeAttachment {
+                provider: "shuvcode".into(),
+                home_id: "home".into(),
+                session_id: "ses_a".into(),
+                location: "/tmp".into(),
+                host_id: "local".into(),
+                attach_argv: vec![],
+            },
+            seq: Some(7),
+            state,
+            label: label.map(str::to_string),
+            ttl_ms: 1_000,
+            fresh,
+        }
+    }
+
+    fn terminal() -> TerminalState {
+        TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    #[test]
+    fn imported_restore_keeps_fresh_runtime_state_with_new_ttl() {
+        let saved = binding(RuntimeState::Working, Some("compiling"), true);
+        let mut terminal = terminal();
+        let now = Instant::now();
+
+        terminal.restore_runtime_binding(Some(&saved), RuntimeBindingRestore::Imported, now);
+
+        let restored = terminal.runtime_binding.as_ref().unwrap();
+        assert_eq!(restored.state, RuntimeState::Working);
+        assert_eq!(restored.label.as_deref(), Some("compiling"));
+        assert_eq!(restored.seq, Some(7));
+        assert!(restored.fresh);
+        assert_eq!(terminal.runtime_observed_at, Some(now));
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(terminal.runtime_state_at(now), AgentState::Working);
+        assert_eq!(
+            terminal.runtime_state_at(now + Duration::from_millis(1_000)),
+            AgentState::Unknown
+        );
+        assert_eq!(terminal.runtime_agent_status(false), AgentStatus::Working);
+        let snapshot = terminal.runtime_binding_snapshot(now).unwrap();
+        assert!(snapshot.fresh);
+        assert_eq!(snapshot.state, RuntimeState::Working);
+        assert!(terminal.next_agent_metadata_expiry().is_some());
+    }
+
+    #[test]
+    fn relaunched_restore_resets_runtime_state_without_ttl() {
+        let saved = binding(RuntimeState::Working, Some("compiling"), true);
+        let mut terminal = terminal();
+        let now = Instant::now();
+
+        terminal.restore_runtime_binding(Some(&saved), RuntimeBindingRestore::Relaunched, now);
+
+        let restored = terminal.runtime_binding.as_ref().unwrap();
+        assert_eq!(restored.state, RuntimeState::Unknown);
+        assert_eq!(restored.label, None);
+        assert_eq!(restored.seq, Some(7));
+        assert!(!restored.fresh);
+        assert_eq!(terminal.runtime_observed_at, None);
+        assert_eq!(terminal.runtime_expiry(), None);
+        assert_eq!(terminal.state, AgentState::Unknown);
+        assert_eq!(terminal.runtime_state_at(now), AgentState::Unknown);
+        assert_eq!(terminal.runtime_agent_status(false), AgentStatus::Unknown);
+    }
+
+    #[test]
+    fn imported_restore_of_stale_or_unknown_binding_stays_unknown() {
+        for saved in [
+            binding(RuntimeState::Working, Some("compiling"), false),
+            binding(RuntimeState::Unknown, None, true),
+            binding(RuntimeState::Unknown, None, false),
+        ] {
+            let mut terminal = terminal();
+            let now = Instant::now();
+
+            terminal.restore_runtime_binding(Some(&saved), RuntimeBindingRestore::Imported, now);
+
+            let restored = terminal.runtime_binding.as_ref().unwrap();
+            assert_eq!(restored.state, RuntimeState::Unknown);
+            assert_eq!(restored.label, None);
+            assert!(!restored.fresh);
+            assert_eq!(terminal.runtime_observed_at, None);
+            assert_eq!(terminal.state, AgentState::Unknown);
+            assert_eq!(terminal.runtime_agent_status(false), AgentStatus::Unknown);
+        }
+    }
+
+    #[test]
+    fn restore_without_binding_leaves_detected_state_untouched() {
+        for mode in [
+            RuntimeBindingRestore::Imported,
+            RuntimeBindingRestore::Relaunched,
+        ] {
+            let mut terminal = terminal();
+            terminal.state = AgentState::Idle;
+
+            terminal.restore_runtime_binding(None, mode, Instant::now());
+
+            assert!(terminal.runtime_binding.is_none());
+            assert_eq!(terminal.runtime_observed_at, None);
+            assert_eq!(terminal.state, AgentState::Idle);
+        }
+    }
+
+    #[test]
+    fn snapshot_erases_runtime_state_once_ttl_expires() {
+        let mut terminal = terminal();
+        let observed = Instant::now();
+        let _ = terminal.mutate_runtime_binding(
+            Some(binding(RuntimeState::Blocked, Some("approve"), true)),
+            Some(observed),
+        );
+
+        let live = terminal.runtime_binding_snapshot(observed).unwrap();
+        assert!(live.fresh);
+        assert_eq!(live.state, RuntimeState::Blocked);
+        assert_eq!(live.label.as_deref(), Some("approve"));
+
+        let stale = terminal
+            .runtime_binding_snapshot(observed + Duration::from_millis(1_000))
+            .unwrap();
+        assert!(!stale.fresh);
+        assert_eq!(stale.state, RuntimeState::Unknown);
+        assert_eq!(stale.label, None);
+        assert_eq!(stale.seq, Some(7));
     }
 }

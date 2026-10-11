@@ -11,6 +11,7 @@ use crate::events::AppEvent;
 use crate::layout::{Node, PaneId, TileLayout};
 use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::render_signal::RenderSignal;
+use crate::runtime_attachment::RuntimeBindingRestore;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
 use crate::workspace::Workspace;
 
@@ -465,7 +466,11 @@ fn unavailable_restored_terminal(
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
-        terminal.restore_runtime_binding(pane.runtime_binding.as_ref());
+        terminal.restore_runtime_binding(
+            pane.runtime_binding.as_ref(),
+            RuntimeBindingRestore::Relaunched,
+            std::time::Instant::now(),
+        );
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
@@ -599,7 +604,11 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
-            terminal.restore_runtime_binding(saved_runtime_binding);
+            terminal.restore_runtime_binding(
+                saved_runtime_binding,
+                RuntimeBindingRestore::Relaunched,
+                std::time::Instant::now(),
+            );
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -697,7 +706,15 @@ fn restore_tab(
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
                     }
                 }
-                terminal.restore_runtime_binding(saved_runtime_binding);
+                terminal.restore_runtime_binding(
+                    saved_runtime_binding,
+                    if was_imported {
+                        RuntimeBindingRestore::Imported
+                    } else {
+                        RuntimeBindingRestore::Relaunched
+                    },
+                    std::time::Instant::now(),
+                );
                 terminal.restore_error = startup.restore_error.map(str::to_owned);
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
