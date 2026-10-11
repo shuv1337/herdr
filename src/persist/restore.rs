@@ -2061,5 +2061,25 @@ mod tests {
             rejected.restore_plan.is_none(),
             "invalid exact attachment must not fall back to bare Session resume"
         );
+
+        binding.attachment.attach_argv.pop();
+        binding
+            .attachment
+            .attach_argv
+            .splice(..5, ["/bin/sh".to_string()]);
+        let mut resumed = HashSet::new();
+        let mut state = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+        };
+        let disallowed =
+            pane_restore_startup(Some(&session), Some(&binding), Some(&history), &mut state);
+        assert_eq!(disallowed.initial_history_ansi, Some("KEEP_HISTORY\r\n"));
+        assert_eq!(
+            disallowed.restore_error,
+            Some("restore requires an allowlisted shuvcode attach executable")
+        );
+        assert!(disallowed.restore_plan.is_none());
+        assert!(disallowed.reserved_agent_session.is_none());
     }
 }
