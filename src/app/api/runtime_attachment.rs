@@ -252,6 +252,7 @@ impl App {
                 },
             );
         }
+        let pruned = self.state.prune_runtime_binding_owners();
         if exact {
             if let Some(update) = self.state.update_terminal_state(pane_id, |terminal| {
                 Some(terminal.mutate_runtime_binding(None, None))
@@ -259,8 +260,10 @@ impl App {
                 self.emit_pane_state_update(&update);
             }
             self.sync_agent_metadata_deadline();
-            self.schedule_session_save();
             self.emit_pane_updated(ws_idx, pane_id);
+        }
+        if exact || pruned {
+            self.schedule_session_save();
         }
         encode_success(
             id,
@@ -391,6 +394,110 @@ mod tests {
         };
         assert_eq!(binding.seq, Some(10));
         assert_eq!(binding.state, RuntimeState::Unknown);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn runtime_attachment_owner_is_pruned_when_owning_pane_closes() {
+        let mut app = app();
+        let pane_id = |app: &App, tab: usize| {
+            app.public_pane_id(0, app.state.workspaces[0].tabs[tab].root_pane)
+                .unwrap()
+        };
+        let bound_pane = pane_id(&app, 0);
+        let unbound_pane = pane_id(&app, 1);
+        let survivor_pane = pane_id(&app, 2);
+        let bind = |pane_id: &str, binding_id: &str| PaneBindRuntimeParams {
+            pane_id: pane_id.into(),
+            binding_id: binding_id.into(),
+            attachment: attachment(),
+        };
+        for (pane, binding_id) in [(&bound_pane, "bound"), (&unbound_pane, "unbound")] {
+            assert!(app
+                .handle_pane_bind_runtime("bind".into(), bind(pane, binding_id))
+                .contains("\"applied\":true"));
+        }
+        assert!(app
+            .handle_pane_unbind_runtime(
+                "unbind".into(),
+                PaneUnbindRuntimeParams {
+                    pane_id: unbound_pane.clone(),
+                    binding_id: "unbound".into(),
+                }
+            )
+            .contains("\"applied\":true"));
+        assert!(app.state.runtime_binding_owners.contains_key("unbound"));
+
+        app.handle_pane_close(
+            "close-bound".into(),
+            PaneTarget {
+                pane_id: bound_pane,
+            },
+        );
+        assert!(!app.state.runtime_binding_owners.contains_key("bound"));
+        assert!(app.state.runtime_binding_owners.contains_key("unbound"));
+        app.state.assert_invariants_for_test();
+
+        app.handle_pane_close(
+            "close-unbound".into(),
+            PaneTarget {
+                pane_id: unbound_pane,
+            },
+        );
+        assert!(app.state.runtime_binding_owners.is_empty());
+        app.state.assert_invariants_for_test();
+
+        let rebound: SuccessResponse = serde_json::from_str(
+            &app.handle_pane_bind_runtime("rebind".into(), bind(&survivor_pane, "bound")),
+        )
+        .unwrap();
+        let ResponseResult::PaneRuntime {
+            binding: Some(binding),
+            ..
+        } = rebound.result
+        else {
+            panic!("released binding should bind to a live pane")
+        };
+        assert_eq!(binding.pane_id, survivor_pane);
+        assert_eq!(binding.seq, None);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn runtime_attachment_unbind_prunes_owners_of_missing_panes() {
+        let mut app = app();
+        let pane_id = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap();
+        let bind = PaneBindRuntimeParams {
+            pane_id: pane_id.clone(),
+            binding_id: "binding-a".into(),
+            attachment: attachment(),
+        };
+        app.handle_pane_bind_runtime("bind".into(), bind.clone());
+        let mut stale = app.state.runtime_binding_owners["binding-a"].clone();
+        stale.binding_id = "stale".into();
+        stale.pane_id = format!("{}:p{}", app.state.workspaces[0].id, "ZZZ");
+        app.state
+            .runtime_binding_owners
+            .insert("stale".into(), stale);
+        assert!(app
+            .handle_pane_unbind_runtime(
+                "unbind".into(),
+                PaneUnbindRuntimeParams {
+                    pane_id: pane_id.clone(),
+                    binding_id: "binding-a".into(),
+                }
+            )
+            .contains("\"applied\":true"));
+        assert_eq!(
+            app.state.runtime_binding_owners.keys().collect::<Vec<_>>(),
+            vec!["binding-a"]
+        );
+        assert_eq!(
+            app.state.runtime_binding_owners["binding-a"].pane_id,
+            pane_id
+        );
         app.state.assert_invariants_for_test();
     }
 

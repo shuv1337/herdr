@@ -1168,6 +1168,13 @@ impl AppState {
     }
 
     pub fn assert_invariants_for_test(&self) {
+        for (binding_id, owner) in &self.runtime_binding_owners {
+            assert!(
+                self.runtime_binding_owner_is_live(&owner.pane_id),
+                "runtime binding owner {binding_id} references closed pane {}",
+                owner.pane_id
+            );
+        }
         if self.workspaces.is_empty() {
             assert!(
                 self.active.is_none(),

@@ -535,6 +535,9 @@ impl App {
         };
 
         state.terminals = restored_terminals;
+        // Owners of panes that did not survive restore, or tombstones from older
+        // snapshots, are dropped and written out with the next session save.
+        state.prune_runtime_binding_owners();
 
         for ws_idx in 0..state.workspaces.len() {
             let cwd = state.workspaces[ws_idx]
@@ -673,6 +676,7 @@ impl App {
         app.terminal_runtimes = runtimes.into();
         app.state.runtime_binding_owners = snapshot.runtime_binding_owners.clone();
         app.sync_agent_metadata_deadline();
+        app.state.prune_runtime_binding_owners();
         app.state.active = snapshot
             .active
             .filter(|&idx| idx < app.state.workspaces.len());

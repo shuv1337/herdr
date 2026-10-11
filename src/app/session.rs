@@ -149,3 +149,61 @@ fn run_session_save_job(
         SessionSaveJob::Save { snapshot, history } => writer.save(&snapshot, history.as_ref()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_save_clears_after_last_runtime_binding_owner_pane_closes() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state = crate::app::AppState::test_with_adversarial_identity_state();
+        app.state.ensure_test_terminals();
+        let pane_id = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .expect("root pane should have a public ID");
+        app.state.runtime_binding_owners.insert(
+            "binding-a".into(),
+            crate::api::schema::RuntimeBinding {
+                pane_id,
+                binding_id: "binding-a".into(),
+                attachment: crate::api::schema::RuntimeAttachment {
+                    provider: "shuvcode".into(),
+                    home_id: "home-a".into(),
+                    session_id: "ses_a".into(),
+                    location: "/".into(),
+                    host_id: "local".into(),
+                    attach_argv: vec!["shuvcode".into()],
+                },
+                seq: Some(3),
+                state: crate::api::schema::RuntimeState::Unknown,
+                label: None,
+                ttl_ms: crate::runtime_attachment::DEFAULT_TTL_MS,
+                fresh: false,
+            },
+        );
+        app.state.assert_invariants_for_test();
+        assert!(matches!(
+            app.capture_session_save_job(),
+            SessionSaveJob::Save { .. }
+        ));
+
+        while !app.state.workspaces.is_empty() {
+            app.state.close_selected_workspace();
+        }
+
+        assert!(app.state.runtime_binding_owners.is_empty());
+        assert!(matches!(
+            app.capture_session_save_job(),
+            SessionSaveJob::Clear
+        ));
+        app.state.assert_invariants_for_test();
+    }
+}

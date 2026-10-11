@@ -644,6 +644,36 @@ impl AppState {
                 self.terminal_runtime_shutdowns.push(terminal_id);
             }
         }
+        self.prune_runtime_binding_owners();
+    }
+
+    pub(crate) fn runtime_binding_owner_is_live(&self, public_pane_id: &str) -> bool {
+        let Some((workspace_id, _)) = public_pane_id.split_once(':') else {
+            return false;
+        };
+        self.workspaces
+            .iter()
+            .filter(|ws| ws.id == workspace_id)
+            .any(|ws| {
+                ws.public_pane_numbers.iter().any(|(&pane_id, &number)| {
+                    ws.pane_state(pane_id).is_some()
+                        && crate::workspace::public_pane_id_for_number(&ws.id, number)
+                            == public_pane_id
+                })
+            })
+    }
+
+    /// Drops binding owners, bound or unbound, whose public pane no longer exists.
+    /// Owners of open panes are kept so an unbind followed by a rebind of the same
+    /// binding on the same pane continues its sequence guard.
+    pub(crate) fn prune_runtime_binding_owners(&mut self) -> bool {
+        let before = self.runtime_binding_owners.len();
+        let owners = std::mem::take(&mut self.runtime_binding_owners);
+        self.runtime_binding_owners = owners
+            .into_iter()
+            .filter(|(_, owner)| self.runtime_binding_owner_is_live(&owner.pane_id))
+            .collect();
+        self.runtime_binding_owners.len() != before
     }
 
     pub(crate) fn remove_plugin_pane_records(
