@@ -137,15 +137,21 @@ For direct installs, changing channels checks the selected channel and installs 
 
 Preview builds are regularly published GitHub prereleases from the current development branch. They are useful when you want fixes before the next stable release, but they can regress. Homebrew, mise, and Nix installs do not use the preview channel.
 
+The preview channel also installs stable releases when their version is higher than the latest preview's base version. It stays configured for preview, so a later preview based on that stable release becomes available automatically. Update checks do not offer releases based on an older version than the installed binary.
+
 Stable is the recommended channel for normal Windows use. Preview receives fixes sooner but can regress, so opt in only when you want that tradeoff. Existing Windows preview installs remain on preview until you switch them explicitly. If an older preview build rejects `herdr channel set stable`, run `herdr update` once on preview, then retry the channel switch.
 
 By default, `herdr update` installs the new binary and leaves endpoint-generation-1 servers and their pane processes running. Start Herdr again to reconnect with the updated client. Client-only changes work immediately. A new server-side action stays unavailable until that server is updated and restarted; the client shows a notice instead of disconnecting. Servers from before endpoint generation 1 need one final stop during update.
+
+When it finishes, `herdr update` lists any running server still on the old version with the command that restarts it, and your saved SSH machines, which run their own Herdr. Run `herdr update` on each machine to update it too.
 
 To opt into experimental live server handoff for supported running sessions, run:
 
 ```bash
 herdr update --handoff
 ```
+
+When both servers support agent-status transfer, live handoff preserves hook-reported agent status until the next report arrives. Handoff from an older server can temporarily show a running agent as idle.
 
 Live handoff does not apply to Homebrew, mise, or Nix package-manager updates. For those installs, update with the package manager, then run Herdr again to reconnect with the updated client. The compatible old server keeps running. Restart it later with `herdr server stop` or `herdr session stop <name>` only when you want server-side changes from the new release.
 

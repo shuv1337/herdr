@@ -3,7 +3,7 @@ title: 集成
 description: 为 Pi、ShuvPi、OMP、Claude Code、Codex、GitHub Copilot CLI、Devin CLI、Droid、Kimi Code CLI、OpenCode、Kilo Code CLI、Hermes Agent、Qoder CLI、Qwen Code、Letta Code、Cursor Agent CLI、MastraCode、Antigravity CLI 和 Grok CLI 安装 Herdr 集成。
 ---
 
-Herdr 自动检测受支持的智能体。官方集成可以额外提供用于恢复的原生会话身份、生命周期状态上报,或两者兼有。
+Herdr 会自动检测它支持的智能体。安装智能体的集成后,Herdr 可以在服务器重启后恢复同一个会话。部分集成还会直接上报智能体的状态。哪些智能体由 Herdr 支持、哪些智能体自己支持 Herdr,见[智能体](/zh-cn/docs/agents/)。
 
 当你想要智能体原生会话恢复、直接生命周期上报,或两者都要时,使用集成。完整的状态权威模型见[智能体](/zh-cn/docs/agents/)。
 
@@ -61,45 +61,15 @@ Herdr 对 Linux/macOS 上的集成配置和所有平台的新文件使用原子�
 
 ## Herdr 如何使用集成
 
-Herdr 以两种不同方式使用集成:
+每个集成都会告诉 Herdr 智能体当前所在的会话,这样 Herdr 就能在服务器重启后恢复它。用 `[session] resume_agents_on_restore = false` 可以关闭。
 
-| 集成类型 | 智能体 | 效果 |
-| --- | --- | --- |
-| 生命周期权威 | Pi、ShuvPi、OMP、Kimi Code CLI、OpenCode、Kilo Code CLI、MastraCode | 已安装且在为该窗格主动上报时,由钩子或插件事件决定 `idle`、`working` 和 `blocked`。对同一个生命周期权威,Herdr 不再使用屏幕清单兜底。 |
-| 会话身份 | Claude Code、Codex、GitHub Copilot CLI、Devin CLI、Droid、Qoder CLI、Qwen Code、Letta Code、Cursor Agent CLI、Hermes Agent、Antigravity CLI、Grok CLI | 集成上报用于恢复的原生会话引用。状态仍来自 Herdr 的屏幕清单检测。 |
+Pi、ShuvPi、OMP、Kimi Code CLI、OpenCode、Kilo Code CLI 和 MastraCode 的集成还会上报智能体的状态。在它们上报期间,Herdr 使用这些上报,而不是读取屏幕。其他集成则把状态交给屏幕检测。
 
-自定义集成在定义了原生终端 UI 中不可见的状态时,也可以上报状态。它们不需要内置到 Herdr 中,也不要求 Herdr 识别智能体的可执行文件。
+原生会话恢复需要最新的 Herdr 集成: Pi 集成版本 `2`、OMP 版本 `3`、Claude Code 版本 `6`、Codex 版本 `5`、GitHub Copilot CLI 版本 `2`、Devin CLI 版本 `2`、Droid 版本 `2`、Kimi Code CLI 版本 `3`、Qoder CLI 版本 `2`、Qwen Code 版本 `1`、Letta Code 版本 `1`、Cursor Agent CLI 版本 `1`、Grok CLI 版本 `2`、OpenCode 版本 `5`、Kilo Code CLI 版本 `1`、Hermes Agent 版本 `5`、MastraCode 版本 `1`、Antigravity CLI 版本 `1`。用 `herdr integration status` 查看已安装版本。
 
 ## 集成你自己的智能体
 
-在 Herdr 窗格中运行的智能体会继承 `HERDR_ENV`、`HERDR_PANE_ID`、`HERDR_BIN_PATH` 和 `HERDR_SOCKET_PATH`。如果智能体提供生命周期钩子,可从这些钩子通过 Herdr CLI 上报语义状态:
-
-```bash
-"$HERDR_BIN_PATH" pane report-agent "$HERDR_PANE_ID" \
-  --source custom:my-agent \
-  --agent my-agent \
-  --state working
-```
-
-当智能体等待输入时上报 `idle`,需要用户决策时上报 `blocked`。用 `--message` 描述阻塞原因。智能体退出时,释放同一来源的生命周期权威:
-
-```bash
-"$HERDR_BIN_PATH" pane release-agent "$HERDR_PANE_ID" \
-  --source custom:my-agent \
-  --agent my-agent
-```
-
-仅在 `HERDR_ENV=1` 且必要变量存在时上报,这样集成在 Herdr 外不会执行任何操作。保持 `--source` 稳定且对该集成唯一。如果上报可能乱序到达,请加入严格递增的 `--seq`;Herdr 会忽略同一来源的旧序列号。
-
-你可以在 `report-agent` 中加入 `--agent-session-id` 或 `--agent-session-path`,也可以在会话身份独立于状态变化时使用 `pane report-agent-session`。Herdr 会通过窗格和智能体 API 暴露该引用。自动恢复会话还要求 Herdr 知道如何启动该智能体并恢复所引用的会话。
-
-要实现可移植的集成,请使用 `HERDR_BIN_PATH` 和 CLI 包装命令。需要直接 IPC 的代码可以发送 [Socket API](/zh-cn/docs/socket-api/) 中说明的等效 `pane.report_agent`、`pane.report_agent_session` 和 `pane.release_agent` 请求。
-
-[Prime Agent 内置的 Herdr 上报器](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/src/core/extensions/builtin/herdr-agent-state.ts)是一个真实实现示例。它只在 Herdr 中启用,将智能体事件映射为 `working`、`idle` 和 `blocked`,跨会话保持上报顺序,并在退出时释放权威。
-
-一些集成会上报智能体的原生会话引用。除非被 `[session] resume_agents_on_restore = false` 禁用,Herdr 会在服务器重启后使用官方会话引用恢复 Claude Code、Codex、Devin CLI、Droid、Kimi Code CLI、Qoder CLI、Qwen Code、Letta Code、Cursor Agent CLI、Grok CLI、GitHub Copilot CLI、Pi、ShuvPi、OMP、Hermes Agent、OpenCode、Kilo Code CLI、MastraCode 和 Antigravity CLI 的窗格。
-
-原生会话恢复需要最新的 Herdr 集成: Pi 集成版本 `2`、ShuvPi 版本 `1`、OMP 版本 `3`、Claude Code 版本 `6`、Codex 版本 `5`、GitHub Copilot CLI 版本 `2`、Devin CLI 版本 `2`、Droid 版本 `2`、Kimi Code CLI 版本 `3`、Qoder CLI 版本 `2`、Qwen Code 版本 `1`、Letta Code 版本 `1`、Cursor Agent CLI 版本 `1`、Grok CLI 版本 `2`、OpenCode 版本 `10`、Kilo Code CLI 版本 `1`、Hermes Agent 版本 `5`、MastraCode 版本 `1`、Antigravity CLI 版本 `1`。用 `herdr integration status` 查看已安装版本。
+如果你在开发编码智能体,可以在不为 Herdr 添加原生支持的情况下,从你自己的代码向 Herdr 上报它的状态和恢复命令。参阅[为你的智能体添加 Herdr 支持](/zh-cn/docs/add-herdr-support/)。
 
 ## Pi
 
@@ -240,6 +210,10 @@ herdr integration install opencode
 安装会把 V1 TUI 插件登记到 `tui.jsonc`，把 V2 TUI 插件登记到 `cli.json`，并保留其他偏好和插件。若 `tui.json` 里已有 V1 登记，则视为已安装，不再创建 `tui.jsonc`。卸载只从这两个 TUI 配置文件中移除 Herdr 登记，文件及其他偏好会保留。如果宿主仍有待导入的 V1 TUI 偏好（`tui.json` 或 `kv.json`），Herdr 会推迟写入 `cli.json`，以便首次启动迁移能够运行；请先启动一次 V2 客户端，再重新安装该集成。否则 Herdr 会创建 `cli.json` 并写入插件登记。安装后请重启 TUI。卸载会删除受管插件文件及其配置条目。重新安装还会删除旧的 fork 插件包 `plugins/herdr-agent-state/`，以免与上游形状的插件一并加载。
 
 V2 生命周期上报运行在窗格本地 TUI 中，即使多个窗格共享同一服务器，也会关联到当前选中的根会话。只要后代会话仍在运行，窗格就保持 working，并在回到 idle 前短暂等待。完成和中断会使该次执行的未处理 permission 失效，包括过期刷新结果返回的已回复请求；仍有效的 permission 请求和待处理表单会使窗格保持 blocked。根会话执行失败后，整个会话族结束运行时回到 idle，并显示 `failed` 状态标签，直到下一次根会话执行开始。根会话路由上的 autoaccept permission 短暂闪烁会延迟上报，但 prompt 模式请求、表单和子会话路由上的停滞仍会立即显示。由于插件 API 未公开 permission 模式和 CLI 参数，集成会轮询 `cli.json` 中的实时 `session.permissions` 设置，并遵循 `OPENCODE_CLI_CONFIG_CONTENT`、`--auto`、`--yolo` 和 `--dangerously-skip-permissions`。当前 TUI 中 CLI auto 标志优先于设置。单独的应用设置 `permissions.autoApprove` 未向 TUI 插件公开。将 `HERDR_OPENCODE_TRACE` 设为文件路径可启用上报诊断（事件原因、会话 ID、阻塞项键和状态，不含提示内容）。V2 Mini 和无头客户端不运行 TUI 插件，因此不会提供这种生命周期上报。
+
+V1 TUI 跟踪窗格选中的会话及其后代。只要其中任何会话仍在忙碌或重试，就保持 working；存在待处理的权限请求或问题时保持 blocked。连接时会读取已有活动，已取消工具的请求不会在重新连接后再次变成阻塞项。查看子代理时保留原来的会话范围；直接连接子会话时只跟踪它及其后代，不包括兄弟会话。
+
+本地 V1 的 `opencode run` 和 `opencode --mini` 保留原有服务端钩子；此变更不会为 Mini 或无界面客户端添加窗格本地的生命周期上报。更新集成后，请同时重启共享 OpenCode 服务器及其 TUI，避免旧服务端上报覆盖窗格本地状态。
 
 该插件会在任一宿主运行于 Herdr 窗格内时上报生命周期状态和会话身份。标准 OpenCode 仍识别为 `opencode`，并通过 `opencode --session <id>` 恢复；ShuvCode 识别为 `shuvcode`，并通过 `shuvcode --session <id>` 恢复。两种身份共享 OpenCode 的检测行为以及 `ui.sidebar.agents.rows_by_agent.opencode` / `ui.sound.agents.open_code` 设置。插件未安装时，屏幕清单检测仍然可用。
 

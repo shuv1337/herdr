@@ -16,7 +16,8 @@ use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
 use crate::workspace::Workspace;
 
 use super::snapshot::{
-    PaneAgentSessionSnapshot, PaneHistorySnapshot, TabHistorySnapshot, WorkspaceHistorySnapshot,
+    PaneAgentResumeSnapshot, PaneAgentSessionSnapshot, PaneHistorySnapshot, TabHistorySnapshot,
+    WorkspaceHistorySnapshot,
 };
 use super::{
     DirectionSnapshot, LayoutSnapshot, SessionHistorySnapshot, SessionSnapshot, TabSnapshot,
@@ -425,22 +426,20 @@ fn restore_workspace(
         return (None, failed_imports);
     }
 
-    let worktree_space = restored_worktree_space_membership(snap.worktree_space.clone());
-    let (cached_git_space, cached_auto_label, cached_git_status_key) =
-        crate::workspace::discover_workspace_git_identity(&snap.identity_cwd);
-
     (
         Some(Workspace {
             id: workspace_id,
             custom_name: snap.custom_name.clone(),
             identity_cwd: snap.identity_cwd.clone(),
             cached_identity_cwd: snap.identity_cwd.clone(),
-            cached_auto_label,
-            cached_git_status_key,
-            cached_git_branch: crate::workspace::git_branch(&snap.identity_cwd),
+            // Repository metadata is optional and may block on unavailable
+            // storage. The app refreshes it after restoring the session.
+            cached_auto_label: crate::workspace::fallback_label_from_cwd(&snap.identity_cwd),
+            cached_git_status_key: snap.identity_cwd.clone(),
+            cached_git_branch: None,
             cached_git_ahead_behind: None,
-            cached_git_space,
-            worktree_space,
+            cached_git_space: None,
+            worktree_space: snap.worktree_space.clone(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
@@ -475,6 +474,9 @@ fn unavailable_restored_terminal(
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
+        if let Some(resume) = saved_reported_resume(pane) {
+            terminal.restore_reported_resume(reported_resume_from_snapshot(resume));
+        }
         match (
             pane.agent_name.as_ref(),
             pane.managed_agent_kind
@@ -489,15 +491,21 @@ fn unavailable_restored_terminal(
     terminal
 }
 
-fn restored_worktree_space_membership(
+pub(crate) fn restored_worktree_space_membership(
     space: Option<crate::workspace::WorktreeSpaceMembership>,
 ) -> Option<crate::workspace::WorktreeSpaceMembership> {
     space.filter(|space| {
-        space.checkout_path.exists()
-            && (crate::workspace::git_space_metadata(&space.checkout_path)
-                .is_some_and(|current| current.key == space.key)
-                || crate::worktree::jj_space_metadata(&space.checkout_path)
-                    .is_some_and(|current| current.key == space.key))
+        crate::workspace::git_space_metadata(&space.checkout_path).is_none_or(|current| {
+            // Discovery may find an ancestor repo, or fall back to a per-worktree
+            // Git directory without objects when common-directory metadata is unreadable.
+            current.checkout_key
+                != crate::worktree::canonical_or_original(&space.checkout_path)
+                    .display()
+                    .to_string()
+                || current.key == space.key
+                || !std::path::Path::new(&current.key).join("objects").is_dir()
+        }) || crate::worktree::jj_space_metadata(&space.checkout_path)
+            .is_some_and(|current| current.key == space.key)
     })
 }
 
@@ -560,6 +568,9 @@ fn restore_tab(
         let saved_agent_session = saved_pane
             .filter(|p| p.runtime_binding.is_none())
             .and_then(|p| p.agent_session.as_ref());
+        let saved_agent_resume = saved_pane
+            .filter(|p| p.runtime_binding.is_none())
+            .and_then(saved_reported_resume);
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
@@ -570,10 +581,15 @@ fn restore_tab(
             pane_restore_startup(
                 saved_agent_session,
                 saved_runtime_binding,
+                saved_agent_resume,
+                &cwd,
                 saved_history,
                 &mut agent_restore,
             )
         };
+        let restored_agent_resume = saved_agent_resume
+            .filter(|_| !startup.duplicate_agent_session)
+            .map(reported_resume_from_snapshot);
         let restored_agent_session =
             restored_terminal_agent_session(saved_agent_session, startup.duplicate_agent_session);
         let initial_restore_agent = startup
@@ -596,6 +612,10 @@ fn restore_tab(
             .unwrap_or_default();
         let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
         let was_imported = imported_runtime.is_some();
+        #[cfg(unix)]
+        let handoff_agent_state = imported_runtime
+            .as_ref()
+            .and_then(|imported| imported.state.agent_state.clone());
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -615,6 +635,9 @@ fn restore_tab(
             }
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
+            }
+            if let Some(resume) = restored_agent_resume {
+                terminal.restore_reported_resume(resume);
             }
             match (saved_agent_name, saved_managed_agent) {
                 (Some(agent_name), Some(agent)) => {
@@ -723,6 +746,9 @@ fn restore_tab(
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
+                if let Some(resume) = restored_agent_resume {
+                    terminal.restore_reported_resume(resume);
+                }
                 match (saved_agent_name, saved_managed_agent) {
                     (Some(agent_name), Some(agent)) if was_imported => {
                         terminal.restore_managed_agent(agent_name, agent)
@@ -742,6 +768,10 @@ fn restore_tab(
                         false,
                         std::time::Instant::now(),
                     );
+                }
+                #[cfg(unix)]
+                if let Some(agent_state) = handoff_agent_state {
+                    terminal.restore_handoff_agent_state(agent_state);
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -830,6 +860,8 @@ fn restore_tab(
 fn pane_restore_startup<'a>(
     session: Option<&PaneAgentSessionSnapshot>,
     runtime: Option<&crate::api::schema::RuntimeBinding>,
+    reported_resume: Option<&PaneAgentResumeSnapshot>,
+    cwd: &std::path::Path,
     history: Option<&'a PaneHistorySnapshot>,
     agent_restore: &mut AgentRestoreState<'_>,
 ) -> PaneRestoreStartup<'a> {
@@ -870,8 +902,13 @@ fn pane_restore_startup<'a>(
     // resumable agent session and resume is enabled, do not replay saved pane
     // presentation history into that terminal, even when this pane is a
     // duplicate suppressed by session de-duplication.
-    let restore_plan =
-        session.and_then(|session| restore_plan_for_snapshot(session, agent_restore.enabled));
+    let restore_plan = if !agent_restore.enabled {
+        None
+    } else if let Some(resume) = reported_resume {
+        Some(reported_resume_from_snapshot(resume).plan(cwd))
+    } else {
+        session.and_then(|session| restore_plan_for_snapshot(session, true))
+    };
     let has_native_agent_restore = restore_plan.is_some();
     // Reserve before spawning so later panes in the same restore pass cannot
     // launch the same native agent session. The caller rolls this reservation
@@ -904,6 +941,22 @@ fn pane_restore_startup<'a>(
         duplicate_agent_session,
         reserved_agent_session,
         restore_error: None,
+    }
+}
+
+fn saved_reported_resume(pane: &super::snapshot::PaneSnapshot) -> Option<&PaneAgentResumeSnapshot> {
+    pane.agent_resume
+        .as_ref()
+        .filter(|resume| crate::agent_resume::validate_resume_argv(&resume.argv).is_ok())
+}
+
+fn reported_resume_from_snapshot(
+    resume: &PaneAgentResumeSnapshot,
+) -> crate::agent_resume::ReportedAgentResume {
+    crate::agent_resume::ReportedAgentResume {
+        source: resume.source.clone(),
+        agent: resume.agent.clone(),
+        argv: resume.argv.clone(),
     }
 }
 
@@ -1121,18 +1174,80 @@ mod tests {
     }
 
     #[test]
-    fn restored_worktree_space_membership_drops_missing_checkout() {
-        let missing =
-            std::env::temp_dir().join(format!("herdr-missing-worktree-{}", std::process::id()));
+    fn restored_worktree_space_membership_preserves_unavailable_checkout_and_rejects_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-restored-worktree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let ancestor = crate::workspace::git_space_metadata(&root).unwrap();
+        let checkout = root.join("checkout");
         let membership = crate::workspace::WorktreeSpaceMembership {
-            key: "repo-key".into(),
+            key: "original-repo-key".into(),
             label: "herdr".into(),
-            repo_root: missing.join("repo"),
-            checkout_path: missing.join("checkout"),
+            repo_root: root.join("original-repo"),
+            checkout_path: checkout.clone(),
             is_linked_worktree: true,
         };
 
-        assert_eq!(restored_worktree_space_membership(Some(membership)), None);
+        // Missing and leftover directories may discover an unrelated ancestor repo.
+        assert_eq!(
+            restored_worktree_space_membership(Some(membership.clone())),
+            Some(membership.clone())
+        );
+        std::fs::create_dir_all(&checkout).unwrap();
+        assert_eq!(
+            restored_worktree_space_membership(Some(membership.clone())),
+            Some(membership.clone())
+        );
+
+        // A real repository at the saved checkout path can prove replacement.
+        std::fs::create_dir_all(checkout.join(".git/objects")).unwrap();
+        std::fs::write(checkout.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(
+            restored_worktree_space_membership(Some(membership.clone())),
+            None
+        );
+        let current = crate::workspace::git_space_metadata(&checkout).unwrap();
+        assert_ne!(current.key, ancestor.key);
+        let matching = crate::workspace::WorktreeSpaceMembership {
+            key: current.key,
+            ..membership.clone()
+        };
+        assert_eq!(
+            restored_worktree_space_membership(Some(matching.clone())),
+            Some(matching)
+        );
+
+        // Partial linked-worktree metadata is not evidence of replacement.
+        std::fs::remove_dir_all(checkout.join(".git")).unwrap();
+        let git_dir = root.join(".git/worktrees/restored");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        let linked = crate::workspace::WorktreeSpaceMembership {
+            key: ancestor.key,
+            ..membership.clone()
+        };
+        assert_eq!(
+            restored_worktree_space_membership(Some(linked.clone())),
+            Some(linked)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(crate::workspace::git_space_metadata(&checkout).is_none());
+        assert_eq!(
+            restored_worktree_space_membership(Some(membership.clone())),
+            Some(membership)
+        );
     }
 
     #[test]
@@ -1215,8 +1330,14 @@ mod tests {
             resumed_sessions: &mut resumed,
         };
 
-        let startup =
-            pane_restore_startup(Some(&session), None, Some(&history), &mut agent_restore);
+        let startup = pane_restore_startup(
+            Some(&session),
+            None,
+            None,
+            std::path::Path::new("/a"),
+            Some(&history),
+            &mut agent_restore,
+        );
 
         assert!(startup.restore_plan.is_some());
         assert!(startup.initial_history_ansi.is_none());
@@ -1241,15 +1362,122 @@ mod tests {
             resumed_sessions: &mut resumed,
         };
 
-        let first = pane_restore_startup(Some(&session), None, Some(&history), &mut agent_restore);
-        let duplicate =
-            pane_restore_startup(Some(&session), None, Some(&history), &mut agent_restore);
+        let first = pane_restore_startup(
+            Some(&session),
+            None,
+            None,
+            std::path::Path::new("/a"),
+            Some(&history),
+            &mut agent_restore,
+        );
+        let duplicate = pane_restore_startup(
+            Some(&session),
+            None,
+            None,
+            std::path::Path::new("/a"),
+            Some(&history),
+            &mut agent_restore,
+        );
 
         assert!(first.restore_plan.is_some());
         assert!(first.initial_history_ansi.is_none());
         assert!(duplicate.restore_plan.is_none());
         assert!(duplicate.initial_history_ansi.is_none());
         assert!(duplicate.duplicate_agent_session);
+    }
+
+    #[test]
+    fn pane_restore_startup_prefers_reported_resume_argv() {
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: test_session_path("pi-session.jsonl"),
+        };
+        let resume = super::super::snapshot::PaneAgentResumeSnapshot {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            argv: vec![
+                "pi".into(),
+                "--continue".into(),
+                "--model".into(),
+                "m".into(),
+            ],
+        };
+        let history = super::super::snapshot::PaneHistorySnapshot {
+            ansi: "RESTORED_HISTORY\r\n".into(),
+            lines: 1,
+        };
+        let mut resumed = HashSet::new();
+        let mut agent_restore = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+        };
+
+        let project_a = std::path::Path::new("/project-a");
+        let project_b = std::path::Path::new("/project-b");
+        let startup = pane_restore_startup(
+            Some(&session),
+            None,
+            Some(&resume),
+            project_a,
+            Some(&history),
+            &mut agent_restore,
+        );
+        let plan = startup.restore_plan.expect("reported resume plan");
+        assert_eq!(plan.agent, "pi");
+        assert_eq!(plan.argv, resume.argv);
+        assert!(startup.initial_history_ansi.is_none());
+
+        let custom = super::super::snapshot::PaneAgentResumeSnapshot {
+            source: "prime-agent".into(),
+            agent: "prime-agent".into(),
+            argv: vec!["prime-agent".into(), "--continue".into()],
+        };
+        let first = pane_restore_startup(
+            None,
+            None,
+            Some(&custom),
+            project_a,
+            None,
+            &mut agent_restore,
+        );
+        assert_eq!(first.restore_plan.unwrap().argv, custom.argv);
+        let other_project = pane_restore_startup(
+            None,
+            None,
+            Some(&custom),
+            project_b,
+            None,
+            &mut agent_restore,
+        );
+        assert!(other_project.restore_plan.is_some());
+        let duplicate = pane_restore_startup(
+            None,
+            None,
+            Some(&custom),
+            project_a,
+            None,
+            &mut agent_restore,
+        );
+        assert!(duplicate.restore_plan.is_none());
+        assert!(duplicate.duplicate_agent_session);
+
+        let mut resumed = HashSet::new();
+        let mut disabled = AgentRestoreState {
+            enabled: false,
+            resumed_sessions: &mut resumed,
+        };
+        let startup = pane_restore_startup(
+            None,
+            None,
+            Some(&custom),
+            project_a,
+            Some(&history),
+            &mut disabled,
+        );
+        assert!(startup.restore_plan.is_none());
+        assert_eq!(startup.initial_history_ansi, Some("RESTORED_HISTORY\r\n"));
     }
 
     #[test]
@@ -1270,8 +1498,14 @@ mod tests {
             resumed_sessions: &mut resumed,
         };
 
-        let startup =
-            pane_restore_startup(Some(&session), None, Some(&history), &mut agent_restore);
+        let startup = pane_restore_startup(
+            Some(&session),
+            None,
+            None,
+            std::path::Path::new("/a"),
+            Some(&history),
+            &mut agent_restore,
+        );
 
         assert!(startup.restore_plan.is_none());
         assert_eq!(startup.initial_history_ansi, Some("RESTORED_HISTORY\r\n"));
@@ -1328,6 +1562,14 @@ mod tests {
                     }
                 }
             }
+            let membership = crate::workspace::WorktreeSpaceMembership {
+                key: "saved-repo-key".into(),
+                label: "saved-repo".into(),
+                repo_root: cwd.clone(),
+                checkout_path: missing.clone(),
+                is_linked_worktree: true,
+            };
+            snapshot.workspaces[0].worktree_space = Some(membership.clone());
             let failed = snapshot.workspaces[0].tabs[0].panes.get_mut(&1).unwrap();
             failed.cwd = missing.clone();
             failed.label = Some("keep my pane".into());
@@ -1363,6 +1605,11 @@ mod tests {
                 "a launch failure must not delete a workspace"
             );
             assert_eq!(captured.workspaces[0].tabs.len(), 2);
+            assert_eq!(
+                captured.workspaces[0].worktree_space,
+                Some(membership),
+                "an unavailable checkout must retain its saved repository group across restart"
+            );
             let pane = captured.workspaces[0].tabs[0]
                 .panes
                 .values()
@@ -1427,6 +1674,7 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             runtime_binding: None,
+                            agent_resume: None,
                             launch_argv: None,
                         },
                     )]),
@@ -1510,6 +1758,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 runtime_binding: None,
+                                agent_resume: None,
                                 launch_argv: None,
                             },
                         ),
@@ -1522,6 +1771,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 runtime_binding: None,
+                                agent_resume: None,
                                 launch_argv: None,
                             },
                         ),
@@ -1615,6 +1865,7 @@ mod tests {
                             managed_agent_kind: None,
                             agent_session: None,
                             runtime_binding: None,
+                            agent_resume: None,
                             launch_argv: None,
                         },
                     )]),
@@ -1685,6 +1936,7 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     runtime_binding: None,
+                    agent_resume: None,
                     launch_argv: None,
                 },
             )
@@ -1701,6 +1953,7 @@ mod tests {
                 value: "codex-session".into(),
             }),
             runtime_binding: None,
+            agent_resume: None,
             launch_argv: None,
         };
         let snapshot = SessionSnapshot {
@@ -1854,6 +2107,7 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             runtime_binding: None,
+                            agent_resume: None,
                             launch_argv: None,
                         },
                     )]),
@@ -1926,6 +2180,111 @@ mod tests {
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_preserves_hook_status_until_next_report() {
+        for state_before_handoff in [AgentState::Working, AgentState::Blocked] {
+            let (snapshot, _) = snapshot_with_saved_pane_history();
+            let (events, _events_rx) = mpsc::channel(32);
+            let (workspaces, mut terminals, runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let terminal = terminals.values_mut().next().unwrap();
+            terminal.set_detected_agent_process_at(
+                crate::detect::Agent::Pi,
+                None,
+                std::time::Instant::now(),
+            );
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(
+                    "/var/tmp/handoff-test.jsonl",
+                )
+                .unwrap(),
+            });
+            terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                state_before_handoff,
+                None,
+                Some(
+                    crate::agent_resume::AgentSessionRef::path("/var/tmp/handoff-test.jsonl")
+                        .unwrap(),
+                ),
+                Some(1),
+            );
+            assert_eq!(terminal.state, state_before_handoff);
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+            let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+            let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
+            let runtime = runtimes.values().next().unwrap();
+            runtime
+                .pause_handoff_reader(std::time::Duration::from_secs(2))
+                .unwrap();
+            let mut state = runtime.handoff_runtime_state(pane_id.raw());
+            state.agent_state = terminals.values().next().unwrap().handoff_agent_state();
+            let state = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+            let mut imports = HashMap::from([(
+                pane_id.raw(),
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                    state,
+                },
+            )]);
+            let (_, mut restored_terminals, restored_runtimes) = restore_handoff(
+                &snapshot,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                &mut imports,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+            .unwrap();
+            drop(restored_runtimes);
+            drop(runtimes);
+            let terminal = restored_terminals.values_mut().next().unwrap();
+            assert_eq!(terminal.state, state_before_handoff);
+            terminal.set_detected_state(Some(crate::detect::Agent::Pi), AgentState::Idle);
+            assert_eq!(
+                terminal.state, state_before_handoff,
+                "screen fallback must not erase the transferred hook status"
+            );
+            terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Idle,
+                None,
+                Some(
+                    crate::agent_resume::AgentSessionRef::path("/var/tmp/handoff-test.jsonl")
+                        .unwrap(),
+                ),
+                Some(2),
+            );
+            assert_eq!(
+                terminal.state,
+                AgentState::Idle,
+                "the next hook report must take effect immediately"
+            );
+            assert_eq!(
+                terminal.finish_agent_process_acquisition(),
+                state_before_handoff == AgentState::Blocked
+            );
+        }
     }
 
     #[tokio::test]
@@ -2059,6 +2418,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 runtime_binding: None,
+                agent_resume: None,
                 launch_argv: None,
             },
         );
@@ -2161,17 +2521,38 @@ mod tests {
             enabled: false,
             resumed_sessions: &mut resumed,
         };
-        let startup = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
+        let startup = pane_restore_startup(
+            Some(&session),
+            Some(&binding),
+            None,
+            std::path::Path::new("/a"),
+            None,
+            &mut state,
+        );
         let reservation = startup.reserved_agent_session.clone().unwrap();
         assert_eq!(
             startup.restore_plan.unwrap().argv,
             binding.attachment.attach_argv
         );
-        let duplicate = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
+        let duplicate = pane_restore_startup(
+            Some(&session),
+            Some(&binding),
+            None,
+            std::path::Path::new("/a"),
+            None,
+            &mut state,
+        );
         assert!(duplicate.restore_plan.is_none());
         assert!(duplicate.reserved_agent_session.is_none());
         state.resumed_sessions.remove(&reservation);
-        let retry = pane_restore_startup(Some(&session), Some(&binding), None, &mut state);
+        let retry = pane_restore_startup(
+            Some(&session),
+            Some(&binding),
+            None,
+            std::path::Path::new("/a"),
+            None,
+            &mut state,
+        );
         assert!(retry.restore_plan.is_some());
         binding.attachment.attach_argv.push("--password".into());
         state.enabled = true;
@@ -2179,8 +2560,14 @@ mod tests {
             ansi: "KEEP_HISTORY\r\n".into(),
             lines: 1,
         };
-        let rejected =
-            pane_restore_startup(Some(&session), Some(&binding), Some(&history), &mut state);
+        let rejected = pane_restore_startup(
+            Some(&session),
+            Some(&binding),
+            None,
+            std::path::Path::new("/a"),
+            Some(&history),
+            &mut state,
+        );
         assert_eq!(rejected.initial_history_ansi, Some("KEEP_HISTORY\r\n"));
         assert!(rejected.restore_error.is_some());
         assert!(
@@ -2198,8 +2585,14 @@ mod tests {
             enabled: true,
             resumed_sessions: &mut resumed,
         };
-        let disallowed =
-            pane_restore_startup(Some(&session), Some(&binding), Some(&history), &mut state);
+        let disallowed = pane_restore_startup(
+            Some(&session),
+            Some(&binding),
+            None,
+            std::path::Path::new("/a"),
+            Some(&history),
+            &mut state,
+        );
         assert_eq!(disallowed.initial_history_ansi, Some("KEEP_HISTORY\r\n"));
         assert_eq!(
             disallowed.restore_error,

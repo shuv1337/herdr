@@ -3,7 +3,7 @@ title: インテグレーション
 description: Pi、ShuvPi、OMP、Claude Code、Codex、GitHub Copilot CLI、Devin CLI、Droid、Kimi Code CLI、OpenCode、Kilo Code CLI、Hermes Agent、Qoder CLI、Qwen Code、Letta Code、Cursor Agent CLI、MastraCode、Antigravity CLI、Grok CLI 向けの Herdr インテグレーションをインストールします。
 ---
 
-Herdr は対応エージェントを自動的に検出します。公式インテグレーションは、復元のためのネイティブセッション識別、ライフサイクル状態の報告、またはその両方を追加できます。
+Herdr は対応するエージェントを自動的に検出します。エージェントのインテグレーションをインストールすると、サーバーの再起動後に Herdr が同じセッションを resume できます。一部のインテグレーションはエージェントの状態も直接報告します。Herdr が対応するエージェントと、自ら Herdr に対応するエージェントについては[エージェント](/ja/docs/agents/)を参照してください。
 
 エージェントネイティブのセッション復元、直接のライフサイクル報告、またはその両方が欲しいときにインテグレーションを使ってください。状態権威モデルの全体像は[エージェント](/ja/docs/agents/)を参照してください。
 
@@ -61,45 +61,15 @@ Herdr は Linux/macOS の統合設定と全プラットフォームの新規フ�
 
 ## Herdr がインテグレーションをどう使うか
 
-Herdr はインテグレーションを 2 つの異なる方法で使います:
+どのインテグレーションも、エージェントが今どのセッションにいるかを Herdr に伝えるので、サーバーの再起動後に Herdr がそのセッションを resume できます。`[session] resume_agents_on_restore = false` で無効にできます。
 
-| インテグレーションの種類 | エージェント | 効果 |
-| --- | --- | --- |
-| ライフサイクル権威 | Pi、ShuvPi、OMP、Kimi Code CLI、OpenCode、Kilo Code CLI、MastraCode | インストールされ、そのペインについて能動的に報告している間は、フックまたはプラグインのイベントが `idle`、`working`、`blocked` を決定します。同じライフサイクル権威に対して、Herdr はスクリーンマニフェストのフォールバックを併用しません。 |
-| セッション識別 | Claude Code、Codex、GitHub Copilot CLI、Devin CLI、Droid、Qoder CLI、Qwen Code、Letta Code、Cursor Agent CLI、Hermes Agent、Antigravity CLI、Grok CLI | インテグレーションは復元用のネイティブセッション参照を報告します。状態は引き続き Herdr のスクリーンマニフェスト検出から得られます。 |
+Pi、ShuvPi、OMP、Kimi Code CLI、OpenCode、Kilo Code CLI、MastraCode のインテグレーションは、エージェントの状態も報告します。報告している間、Herdr は画面を読む代わりにその報告を使います。その他のインテグレーションでは、状態は画面検出に任せます。
 
-カスタムインテグレーションも、ネイティブのターミナル UI では見えない状態を定義する場合に状態を報告できます。Herdr への組み込みや、認識済みのエージェント実行ファイルは必要ありません。
+エージェントネイティブのセッション復元には最新の Herdr インテグレーションが必要です: Pi インテグレーションはバージョン `2`、OMP は `3`、Claude Code は `6`、Codex は `5`、GitHub Copilot CLI は `2`、Devin CLI は `2`、Droid は `2`、Kimi Code CLI は `3`、Qoder CLI は `2`、Qwen Code は `1`、Letta Code は `1`、Cursor Agent CLI は `1`、Grok CLI は `2`、OpenCode は `5`、Kilo Code CLI は `1`、Hermes Agent は `5`、MastraCode は `1`、Antigravity CLI は `1` です。インストール済みバージョンは `herdr integration status` で確認してください。
 
 ## 独自エージェントを統合する
 
-Herdr ペイン内で動くエージェントは、`HERDR_ENV`、`HERDR_PANE_ID`、`HERDR_BIN_PATH`、`HERDR_SOCKET_PATH` を継承します。エージェントがライフサイクルフックを提供している場合は、そのフックから Herdr の CLI を使ってセマンティックな状態を報告します:
-
-```bash
-"$HERDR_BIN_PATH" pane report-agent "$HERDR_PANE_ID" \
-  --source custom:my-agent \
-  --agent my-agent \
-  --state working
-```
-
-エージェントが入力待ちになったら `idle`、ユーザーの判断が必要になったら `blocked` を報告します。ブロックの説明には `--message` を使います。エージェントの終了時には、同じ source のライフサイクル権威を解放します:
-
-```bash
-"$HERDR_BIN_PATH" pane release-agent "$HERDR_PANE_ID" \
-  --source custom:my-agent \
-  --agent my-agent
-```
-
-Herdr の外では何もしないように、`HERDR_ENV=1` で必要な変数が存在するときだけ報告してください。`--source` はインテグレーションごとに一意かつ固定にします。報告が順不同で届く可能性がある場合は、単調増加する `--seq` を含めてください。Herdr は同じ source から届いた古いシーケンス番号を無視します。
-
-`report-agent` に `--agent-session-id` または `--agent-session-path` を含めることも、セッション識別が状態とは独立して変わる場合に `pane report-agent-session` を使うこともできます。Herdr はその参照をペイン API とエージェント API で公開します。セッションの自動復元には、それに加えて、そのエージェントの起動方法と参照先セッションの再開方法を Herdr が把握している必要があります。
-
-移植可能なインテグレーションには `HERDR_BIN_PATH` と CLI ラッパーを使ってください。直接 IPC が必要なコードでは、[Socket API](/ja/docs/socket-api/) に記載された同等の `pane.report_agent`、`pane.report_agent_session`、`pane.release_agent` リクエストを送信できます。
-
-[Prime Agent の組み込み Herdr レポーター](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/src/core/extensions/builtin/herdr-agent-state.ts)は実際の実装例です。Herdr 内でのみ有効になり、エージェントイベントを `working`、`idle`、`blocked` に対応付け、セッションをまたいで報告順序を維持し、終了時に権威を解放します。
-
-一部のインテグレーションは、エージェントのネイティブセッション参照を報告します。Herdr は公式のセッション参照を使って、`[session] resume_agents_on_restore = false` で無効化されていない限り、Herdr サーバーの再起動後に Claude Code、Codex、Devin CLI、Droid、Kimi Code CLI、Qoder CLI、Qwen Code、Letta Code、Cursor Agent CLI、Grok CLI、GitHub Copilot CLI、Pi、ShuvPi、OMP、Hermes Agent、OpenCode、Kilo Code CLI、MastraCode、Antigravity CLI のペインを resume します。
-
-エージェントネイティブのセッション復元には最新の Herdr インテグレーションが必要です: Pi インテグレーションはバージョン `2`、ShuvPi は `1`、OMP は `3`、Claude Code は `6`、Codex は `5`、GitHub Copilot CLI は `2`、Devin CLI は `2`、Droid は `2`、Kimi Code CLI は `3`、Qoder CLI は `2`、Qwen Code は `1`、Letta Code は `1`、Cursor Agent CLI は `1`、Grok CLI は `2`、OpenCode は `10`、Kilo Code CLI は `1`、Hermes Agent は `5`、MastraCode は `1`、Antigravity CLI は `1` です。インストール済みバージョンは `herdr integration status` で確認してください。
+コーディングエージェントを開発している場合は、Herdr にネイティブサポートを追加せずに、自分のコードからエージェントの状態と resume コマンドを Herdr に報告できます。[エージェントに Herdr 対応を追加する](/ja/docs/add-herdr-support/)を参照してください。
 
 ## Pi
 
@@ -167,7 +137,7 @@ Codex フックをインストールします:
 herdr integration install codex
 ```
 
-Codex フックは、他のインテグレーションと同じローカルソケット API を通じてセッション識別を報告します。Codex の状態は Herdr のスクリーンマニフェスト検出から得られます。
+Codex フックは、他のインテグレーションと同じローカルソケット API を通じてセッション識別を報告します。Codex の状態は Herdr の画面マニフェスト検出から得られます。
 
 Herdr はデフォルトで `~/.codex` を使い、`CODEX_HOME` が設定されていればそちらを使います。Codex の設定ディレクトリはあらかじめ存在している必要があります。インストールは `herdr-agent-state.sh` を書き込み、`hooks.json` を更新し、`config.toml` に `[features] hooks = true` があることを保証します。非推奨のトップレベル `codex_hooks` フラグが存在すれば削除もします。アンインストールは `hooks.json` から Herdr のエントリを削除してフックスクリプトを削除しますが、`config.toml` は変更しません。
 
@@ -240,6 +210,10 @@ herdr integration install opencode
 インストールは V1 TUI プラグインを `tui.jsonc` に、V2 TUI プラグインを `cli.json` に登録し、他の設定とプラグインは残します。既存の `tui.json` 登録もインストール済みとして扱い、`tui.jsonc` は作りません。アンインストールは両方の TUI 設定ファイルから Herdr の登録だけを外し、ファイルとその他の設定は残します。ホストがまだ取り込む V1 TUI 設定（`tui.json` または `kv.json`）を持っている場合、Herdr は初回起動の移行が走るように `cli.json` 登録を延期します。そのときは V2 クライアントを一度起動してからインテグレーションを再インストールしてください。そうでなければ Herdr が `cli.json` を作ってプラグインを登録します。インストール後は TUI を再起動してください。アンインストールは管理下のプラグインファイルと設定エントリを削除します。再インストールは、上流と同じ形のプラグインと二重に読み込まれないよう、古いフォーク用パッケージ `plugins/herdr-agent-state/` も削除します。
 
 V2 のライフサイクル報告はペインローカルな TUI で行われ、複数ペインが 1 つのサーバーを共有していても選択中のルートセッションに紐づけます。子孫セッションの実行中は working を維持し、idle に戻る前に短い待機時間を設けます。完了と中断はその実行の未応答 permission と、古い更新結果に含まれる応答済み要求を失効させます。現在有効な permission 要求と未応答 form は blocked にします。ルートの実行が失敗した場合は、ファミリーの実行終了後に idle に戻り、次のルート実行が始まるまで `failed` 状態ラベルを表示します。ルート画面の autoaccept permission による短い点滅は遅延させますが、prompt モードの要求、form、子セッション画面の停止はすぐに表示します。プラグイン API は permission モードも CLI 引数も公開しないため、連携は `cli.json` のライブ設定 `session.permissions` を定期的に読み取り、`OPENCODE_CLI_CONFIG_CONTENT`、`--auto`、`--yolo`、`--dangerously-skip-permissions` を反映します。現在の TUI では CLI の auto フラグが設定より優先されます。別のアプリ設定 `permissions.autoApprove` は TUI プラグインに公開されていません。`HERDR_OPENCODE_TRACE` にファイルパスを指定すると、報告の診断情報（イベント理由、セッション ID、ブロッカーキー、状態。プロンプト内容は含みません）を記録できます。V2 Mini とヘッドレスクライアントは TUI プラグインを動かさないため、このライフサイクル報告はありません。
+
+V1 TUI はペインで選択したセッションとその子孫を追跡します。いずれかが実行中・再試行中なら working、権限要求や質問が未処理なら blocked を維持します。接続時に既存の状態を読み込み、キャンセル済みツールの要求が再接続後に blocked を復活させることはありません。サブエージェントの閲覧では元のセッション群を維持し、子セッションへ直接接続した場合は兄弟ではなくその子孫だけを追跡します。
+
+ローカル V1 の `opencode run` と `opencode --mini` は従来のサーバーフックを維持します。この変更は Mini やヘッドレスクライアントにペイン固有のライフサイクル報告を追加するものではありません。連携の更新後は TUI と共有 OpenCode サーバーの両方を再起動し、古いサーバー報告がペインの状態を上書きしないようにしてください。
 
 このプラグインは、どちらのホストが Herdr のペイン内で動いている場合も、ライフサイクル状態とセッション識別を報告します。標準 OpenCode は引き続き `opencode` として識別され、`opencode --session <id>` で resume します。ShuvCode は `shuvcode` として識別され、`shuvcode --session <id>` で resume します。両方の識別は OpenCode の検出動作と `ui.sidebar.agents.rows_by_agent.opencode` / `ui.sound.agents.open_code` 設定を共有します。プラグインがインストールされていないときは、スクリーンマニフェスト検出が引き続き利用できます。
 

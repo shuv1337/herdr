@@ -87,7 +87,7 @@ pub(super) fn should_bridge_clipboard_image_paste(
 
 #[cfg(unix)]
 fn clipboard_image_paste_key(data: &[u8]) -> Option<crate::input::TerminalKey> {
-    let events = crate::raw_input::parse_raw_input_bytes_sync(data);
+    let events = crate::raw_input::parse_framed_input(data);
     if let [crate::raw_input::RawInputEvent::Key(key)] = events.as_slice() {
         return Some(key.clone());
     }
