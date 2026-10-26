@@ -411,12 +411,15 @@ fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>
     }
 }
 
-fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<ReleaseInfo>, String> {
-    let current = Version::current();
+fn release_info_from_manifest(
+    manifest: &UpdateManifest,
+    current: &Version,
+    installed_is_preview: bool,
+) -> Result<Option<ReleaseInfo>, String> {
     let latest = Version::parse(&manifest.version)
         .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
 
-    if !stable_channel_should_install(&latest, &current, crate::build_info::is_preview()) {
+    if !stable_channel_should_install(&latest, current, installed_is_preview) {
         return Ok(None); // up to date
     }
 
@@ -479,6 +482,7 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
 
 fn release_info_from_preview_manifest(
     manifest: &PreviewManifest,
+    installed_preview_build_id: Option<&str>,
 ) -> Result<Option<ReleaseInfo>, String> {
     if manifest.channel != "preview" {
         return Err(format!(
@@ -490,9 +494,7 @@ fn release_info_from_preview_manifest(
     if build_id.is_empty() {
         return Err("preview manifest build_id is empty".into());
     }
-    if crate::build_info::is_preview()
-        && crate::build_info::build_id().is_some_and(|current| current == build_id)
-    {
+    if installed_preview_build_id.is_some_and(|current| current == build_id) {
         return Ok(None);
     }
 
@@ -551,7 +553,6 @@ fn release_info_from_preview_manifest(
     }))
 }
 
-/// Check the hosted update manifest for the latest release. Returns release info if newer.
 fn first_windows_stable_is_pending(
     manifest: &UpdateManifest,
     is_windows: bool,
@@ -560,19 +561,65 @@ fn first_windows_stable_is_pending(
     is_windows && installed_is_preview && !manifest.assets.contains_key("windows-x86_64")
 }
 
-fn check_latest() -> Result<Option<ReleaseInfo>, String> {
-    let channel = UpdateChannel::configured();
-    if channel == UpdateChannel::Preview {
-        return release_info_from_preview_manifest(&fetch_preview_manifest()?);
+fn release_info_from_manifests(
+    stable: &UpdateManifest,
+    preview: Option<&PreviewManifest>,
+    current: &Version,
+    installed_is_preview: bool,
+    installed_build_id: Option<&str>,
+) -> Result<Option<ReleaseInfo>, String> {
+    if let Some(preview) = preview {
+        let stable_version = Version::parse(&stable.version)
+            .ok_or_else(|| format!("invalid version in update manifest: {}", stable.version))?;
+        let preview_base = Version::parse(&preview.base_version).ok_or_else(|| {
+            format!(
+                "invalid base_version in preview manifest: {}",
+                preview.base_version
+            )
+        })?;
+        let (os, arch) = platform_target();
+        // A preview is development after its base release; stable supersedes older bases.
+        if stable_version > preview_base && stable.assets.contains_key(&format!("{os}-{arch}")) {
+            if stable_version <= *current {
+                return Ok(None);
+            }
+        } else {
+            if preview_base < *current {
+                return Ok(None);
+            }
+            return release_info_from_preview_manifest(
+                preview,
+                installed_build_id.filter(|_| installed_is_preview),
+            );
+        }
     }
 
-    let manifest = fetch_update_manifest()?;
-    if first_windows_stable_is_pending(&manifest, cfg!(windows), crate::build_info::is_preview()) {
+    if first_windows_stable_is_pending(stable, cfg!(windows), installed_is_preview) {
         tracing::info!("waiting for the first stable Windows release");
         return Ok(None);
     }
-    let release = release_info_from_manifest(&manifest)?;
-    if let Some(release) = &release {
+    release_info_from_manifest(stable, current, installed_is_preview)
+}
+
+/// Check the hosted update manifests for the latest release. Returns release info if newer.
+fn check_latest() -> Result<Option<ReleaseInfo>, String> {
+    let manifest = fetch_update_manifest()?;
+    let preview = if UpdateChannel::configured() == UpdateChannel::Preview {
+        Some(fetch_preview_manifest()?)
+    } else {
+        None
+    };
+    let release = release_info_from_manifests(
+        &manifest,
+        preview.as_ref(),
+        &Version::current(),
+        crate::build_info::is_preview(),
+        crate::build_info::build_id(),
+    )?;
+    if let Some(release) = release
+        .as_ref()
+        .filter(|release| release.channel == UpdateChannel::Stable)
+    {
         if let Some(metadata) = manifest.metadata_for_version(&release.version) {
             handle_manifest_announcement(
                 &release.version.to_string(),
@@ -1816,26 +1863,23 @@ fn print_running_session_update_outcomes(
         return;
     }
 
+    let kept: Vec<KeptServer<'_>> = outcomes
+        .iter()
+        .filter(|outcome| outcome.outcome == RunningServerUpdateOutcome::CompatibleServerKept)
+        .map(|outcome| KeptServer {
+            label: &outcome.session_label,
+            version: version_label(outcome.server_version.as_deref()),
+            stop_command: &outcome.stop_command,
+            attach_command: outcome.attach_command.as_deref(),
+        })
+        .collect();
+    for line in kept_server_notice_lines(&kept, release.label()) {
+        eprintln!("{line}");
+    }
+
     for outcome in outcomes {
         match outcome.outcome {
-            RunningServerUpdateOutcome::CompatibleServerKept => {
-                eprintln!(
-                    "{} {} kept running server v{}.",
-                    outcome.target_noun,
-                    outcome.session_label,
-                    version_label(outcome.server_version.as_deref())
-                );
-                match &outcome.attach_command {
-                    Some(command) => eprintln!(
-                        "Run `{command}` to reconnect with the updated client. Restart the server later only if you need server-side changes from {}.",
-                        release.label()
-                    ),
-                    None => eprintln!(
-                        "Reconnect with the same socket override to use the updated client. Restart the server later only if you need server-side changes from {}.",
-                        release.label()
-                    ),
-                }
-            }
+            RunningServerUpdateOutcome::CompatibleServerKept => {}
             RunningServerUpdateOutcome::LiveHandoffComplete => {
                 if let Some(command) = &outcome.attach_command {
                     eprintln!(
@@ -2143,6 +2187,33 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // Public API
 // ---------------------------------------------------------------------------
 
+#[cfg(any(windows, test))]
+fn preserve_preview_channel_for_install(
+    config_path: &Path,
+    configured_channel: UpdateChannel,
+    release_channel: UpdateChannel,
+) -> Result<(), String> {
+    if configured_channel == UpdateChannel::Preview && release_channel == UpdateChannel::Stable {
+        // Windows preview defaults would otherwise become stable with the new binary.
+        crate::config::update_file_at(config_path, "update channel", |content| {
+            let mut document = content
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|error| format!("cannot preserve update channel: {error}"))?;
+            let update = document
+                .entry("update")
+                .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+                .as_table_like_mut()
+                .ok_or("cannot preserve update channel: update must be a table")?;
+            if update.contains_key("channel") {
+                return Ok(content.to_owned());
+            }
+            update.insert("channel", toml_edit::value("preview"));
+            Ok(document.to_string())
+        })?;
+    }
+    Ok(())
+}
+
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     let channel = UpdateChannel::configured();
@@ -2217,6 +2288,11 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         eprintln!("downloading {}...", release.label());
         let downloaded_update = download_windows_update(&release)?;
         eprintln!("downloaded {}", release.label());
+        preserve_preview_channel_for_install(
+            &crate::config::config_path(),
+            channel,
+            release.channel,
+        )?;
         install_windows_update_with_installer(&release, &downloaded_update)?;
         let updated_exe = windows_installed_herdr_exe_path()?;
         eprintln!("installed {}", release.label());
@@ -2225,6 +2301,7 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
             "Open a new terminal, or reconnect SSH, then start Herdr again to use the updated client. Running servers remain active; restart them later only if you need server-side changes from {}.",
             release.label()
         );
+        print_saved_machine_update_notice();
     }
 
     #[cfg(not(windows))]
@@ -2259,9 +2336,115 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         print_outdated_integration_notice_with_updated_binary(&updated_exe);
 
         print_running_session_update_outcomes(&server_update_outcomes, &release);
+        print_saved_machine_update_notice();
     }
 
     Ok(release.version)
+}
+
+fn print_saved_machine_update_notice() {
+    let profiles = match crate::client::endpoint::EndpointCatalog::load_profiles() {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            tracing::debug!(%error, "skipping saved machine update notice");
+            return;
+        }
+    };
+    for line in saved_machine_update_notice_lines(&profiles) {
+        eprintln!("{line}");
+    }
+}
+
+fn saved_machine_update_notice_lines(
+    profiles: &[crate::client::endpoint::SavedSshEndpoint],
+) -> Vec<String> {
+    let mut targets: Vec<&str> = Vec::new();
+    let mut labels: Vec<&str> = Vec::new();
+    for profile in profiles.iter().filter(|profile| profile.enabled) {
+        if !targets.contains(&profile.target.as_str()) {
+            targets.push(&profile.target);
+            labels.push(&profile.label);
+        }
+    }
+    if labels.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        String::new(),
+        "your SSH machines run their own herdr and may be older:".to_string(),
+    ];
+    lines.extend(labels.into_iter().map(|label| format!("  {label}")));
+    lines.push(
+        "run `herdr update` on each one. it will tell you what to restart there.".to_string(),
+    );
+    lines
+}
+
+#[cfg(not(windows))]
+struct KeptServer<'a> {
+    label: &'a str,
+    version: &'a str,
+    stop_command: &'a str,
+    attach_command: Option<&'a str>,
+}
+
+#[cfg(not(windows))]
+impl KeptServer<'_> {
+    fn reconnect(&self) -> String {
+        match self.attach_command {
+            Some(attach) => format!("`{attach}`"),
+            None => "herdr with the same socket override".to_string(),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn kept_server_notice_lines(kept: &[KeptServer<'_>], release_label: &str) -> Vec<String> {
+    match kept {
+        [] => Vec::new(),
+        [server] => vec![
+            String::new(),
+            format!(
+                "your running server is still v{}. run {} to reconnect; everything keeps working.",
+                server.version,
+                server.reconnect()
+            ),
+            format!("server fixes in v{release_label} apply only after it restarts."),
+            format!(
+                "when your agents are idle, run `{}`, then {}.",
+                server.stop_command,
+                server.reconnect()
+            ),
+            "this closes running panes and their agents.".to_string(),
+        ],
+        servers => {
+            let width = servers
+                .iter()
+                .map(|server| server.label.chars().count())
+                .max()
+                .unwrap_or(0);
+            let mut lines = vec![
+                String::new(),
+                "your running servers are still older. reconnect as usual; everything keeps working."
+                    .to_string(),
+                format!("server fixes in v{release_label} apply only after each one restarts:"),
+            ];
+            lines.extend(servers.iter().map(|server| {
+                format!(
+                    "  {:<width$}  v{}  `{}`, then {}",
+                    server.label,
+                    server.version,
+                    server.stop_command,
+                    server.reconnect()
+                )
+            }));
+            lines.push(
+                "restart one when its agents are idle. this closes its panes and their agents."
+                    .to_string(),
+            );
+            lines
+        }
+    }
 }
 
 fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
@@ -2431,6 +2614,218 @@ fn platform_target() -> (&'static str, &'static str) {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    fn manifests() -> (UpdateManifest, PreviewManifest) {
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let stable = serde_json::from_value(serde_json::json!({
+            "version": "0.9.5",
+            "notes": "stable notes",
+            "protocol": 22,
+            "endpoint_generation": 1,
+            "assets": { (asset_key.clone()): {
+                "url": "https://example.com/stable.zip",
+                "sha256": "stable-checksum",
+                "format": "zip"
+            }}
+        }))
+        .unwrap();
+        let preview = serde_json::from_value(serde_json::json!({
+            "channel": "preview",
+            "base_version": "0.9.4",
+            "build_id": "active-preview",
+            "commit": "preview-commit",
+            "built_at": "2026-10-14T15:27:19Z",
+            "protocol": 23,
+            "endpoint_generation": 1,
+            "notes": "preview notes",
+            "assets": { (asset_key): {
+                "url": "https://example.com/preview.zip",
+                "sha256": "preview-checksum",
+                "format": "zip"
+            }}
+        }))
+        .unwrap();
+        (stable, preview)
+    }
+
+    #[test]
+    fn preview_channel_reconciles_releases_without_downgrading_or_reinstalling() {
+        use UpdateChannel::{Preview, Stable};
+
+        for (current, installed_build, stable_version, preview_base, expected) in [
+            (
+                "0.9.4",
+                Some("active-preview"),
+                "0.9.5",
+                "0.9.4",
+                Some(Stable),
+            ),
+            ("0.9.4", None, "0.9.5", "0.9.4", Some(Stable)),
+            ("0.9.5", None, "0.9.5", "0.9.4", None),
+            ("0.9.5", None, "0.9.5", "0.9.5", Some(Preview)),
+            ("0.9.5", Some("active-preview"), "0.9.5", "0.9.5", None),
+            (
+                "0.9.5",
+                Some("older-preview"),
+                "0.9.5",
+                "0.9.5",
+                Some(Preview),
+            ),
+            (
+                "0.9.5",
+                Some("older-preview"),
+                "0.9.5",
+                "0.9.6",
+                Some(Preview),
+            ),
+            ("0.9.6", Some("older-preview"), "0.9.5", "0.9.4", None),
+            ("0.9.6", Some("older-preview"), "0.9.4", "0.9.5", None),
+            ("0.9.6", None, "0.9.5", "0.9.4", None),
+            ("0.9.5", Some("older-preview"), "0.9.5", "0.9.4", None),
+        ] {
+            let (mut stable, mut preview) = manifests();
+            stable.version = stable_version.into();
+            preview.base_version = preview_base.into();
+            let release = release_info_from_manifests(
+                &stable,
+                Some(&preview),
+                &Version::parse(current).unwrap(),
+                installed_build.is_some(),
+                installed_build,
+            )
+            .unwrap();
+            assert_eq!(
+                release.as_ref().map(|release| release.channel),
+                expected,
+                "installed {current}/{installed_build:?}, stable {stable_version}, preview {preview_base}"
+            );
+            if let Some(release) = release {
+                let source = release.channel.as_str();
+                assert_eq!(
+                    release.download_url,
+                    format!("https://example.com/{source}.zip")
+                );
+                assert_eq!(release.notes_body, format!("{source} notes"));
+                assert_eq!(release.sha256, Some(format!("{source}-checksum")));
+                #[cfg(not(windows))]
+                assert_eq!(
+                    release.target_protocol,
+                    Some(if source == "stable" { 22 } else { 23 })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preview_channel_validates_assets_only_for_the_selected_release() {
+        let (mut stable, mut preview) = manifests();
+        let current = Version::parse("0.9.4").unwrap();
+        let preview_assets = std::mem::take(&mut preview.assets);
+        let release = release_info_from_manifests(
+            &stable,
+            Some(&preview),
+            &current,
+            true,
+            Some("active-preview"),
+        )
+        .unwrap()
+        .expect("stable supersedes the installed preview even without preview assets");
+        assert_eq!(release.channel, UpdateChannel::Stable);
+
+        stable.assets.clear();
+        preview.assets = preview_assets;
+        let release = release_info_from_manifests(
+            &stable,
+            Some(&preview),
+            &current,
+            true,
+            Some("older-preview"),
+        )
+        .unwrap()
+        .expect("preview remains available when stable has no platform asset");
+        assert_eq!(release.channel, UpdateChannel::Preview);
+    }
+
+    #[test]
+    fn explicit_stable_channel_still_allows_returning_from_a_newer_preview() {
+        let (stable, _) = manifests();
+        let release = release_info_from_manifests(
+            &stable,
+            None,
+            &Version::parse("0.9.6").unwrap(),
+            true,
+            Some("newer-preview"),
+        )
+        .unwrap()
+        .expect("explicit stable selection permits a downgrade");
+        assert_eq!(release.identity, "0.9.5");
+        assert_eq!(release.channel, UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn stable_fallback_persists_an_implicit_preview_preference() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-preview-channel-install-{}",
+            std::process::id()
+        ));
+        let path = dir.join("config.toml");
+        for original in [
+            None,
+            Some("# keep settings\n[update]\nversion_check = false\n"),
+            Some("# keep settings\n[update] # updates\nversion_check = false\n"),
+            Some("# keep settings\n[\"update\"] # updates\nversion_check = false\n"),
+            Some("# keep settings\nupdate = { version_check = false }\n"),
+            Some("# keep settings\nupdate.version_check = false\n"),
+            Some("# keep settings\n[update] # updates\nversion_check = false\n'channel' = 'preview' # keep\n"),
+        ] {
+            if let Some(original) = original {
+                fs::write(&path, original).unwrap();
+            }
+            preserve_preview_channel_for_install(
+                &path,
+                UpdateChannel::Preview,
+                UpdateChannel::Stable,
+            )
+            .unwrap();
+            let written = fs::read_to_string(&path).unwrap();
+            let config: crate::config::Config = toml::from_str(&written).unwrap();
+            assert_eq!(
+                config.update.channel,
+                crate::config::UpdateChannelConfig::Preview
+            );
+            if original.is_some() {
+                assert!(!config.update.version_check);
+                assert!(written.starts_with("# keep settings\n"));
+            }
+            if original.is_some_and(|original| original.contains("'channel'")) {
+                assert_eq!(written, original.unwrap());
+            }
+        }
+        for original in ["[update", "update = 1\n"] {
+            fs::write(&path, original).unwrap();
+            assert!(preserve_preview_channel_for_install(
+                &path,
+                UpdateChannel::Preview,
+                UpdateChannel::Stable,
+            )
+            .is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+        fs::remove_file(&path).unwrap();
+        preserve_preview_channel_for_install(&path, UpdateChannel::Stable, UpdateChannel::Stable)
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "stable updates must not create a preview preference"
+        );
+        fs::remove_dir(&dir).unwrap();
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -2441,6 +2836,103 @@ mod tests {
     };
     use std::sync::{Mutex, OnceLock};
     use std::thread;
+
+    fn saved_machine(
+        label: &str,
+        target: &str,
+        enabled: bool,
+    ) -> crate::client::endpoint::SavedSshEndpoint {
+        let mut profile =
+            crate::client::endpoint::SavedSshEndpoint::new(label, target, "default").unwrap();
+        profile.enabled = enabled;
+        profile
+    }
+
+    #[test]
+    fn saved_machine_notice_lists_enabled_machines_once_per_target() {
+        let profiles = [
+            saved_machine("rohan", "rohan", true),
+            saved_machine("rohan/agents", "rohan", true),
+            saved_machine("off", "offbox", false),
+            saved_machine("workbox", "dev@workbox", true),
+        ];
+
+        assert_eq!(
+            saved_machine_update_notice_lines(&profiles),
+            [
+                "",
+                "your SSH machines run their own herdr and may be older:",
+                "  rohan",
+                "  workbox",
+                "run `herdr update` on each one. it will tell you what to restart there.",
+            ]
+        );
+    }
+
+    #[test]
+    fn saved_machine_notice_is_empty_without_enabled_machines() {
+        assert!(saved_machine_update_notice_lines(&[]).is_empty());
+        assert!(
+            saved_machine_update_notice_lines(&[saved_machine("off", "offbox", false)]).is_empty()
+        );
+    }
+
+    #[test]
+    fn kept_server_notice_names_the_session_restart_commands() {
+        let default = KeptServer {
+            label: "default",
+            version: "0.9.1",
+            stop_command: "herdr server stop",
+            attach_command: Some("herdr"),
+        };
+        assert_eq!(
+            kept_server_notice_lines(&[default], "0.10.0"),
+            [
+                "",
+                "your running server is still v0.9.1. run `herdr` to reconnect; everything keeps working.",
+                "server fixes in v0.10.0 apply only after it restarts.",
+                "when your agents are idle, run `herdr server stop`, then `herdr`.",
+                "this closes running panes and their agents.",
+            ]
+        );
+
+        let work = KeptServer {
+            label: "work",
+            version: "0.9.0",
+            stop_command: "herdr session stop work",
+            attach_command: Some("herdr session attach work"),
+        };
+        let default = KeptServer {
+            label: "default",
+            version: "0.9.1",
+            stop_command: "herdr server stop",
+            attach_command: Some("herdr"),
+        };
+        assert_eq!(
+            kept_server_notice_lines(&[default, work], "0.10.0"),
+            [
+                "",
+                "your running servers are still older. reconnect as usual; everything keeps working.",
+                "server fixes in v0.10.0 apply only after each one restarts:",
+                "  default  v0.9.1  `herdr server stop`, then `herdr`",
+                "  work     v0.9.0  `herdr session stop work`, then `herdr session attach work`",
+                "restart one when its agents are idle. this closes its panes and their agents.",
+            ]
+        );
+        assert!(kept_server_notice_lines(&[], "0.10.0").is_empty());
+
+        let socket_override = KeptServer {
+            label: "/tmp/herdr.sock",
+            version: "0.9.1",
+            stop_command: "herdr server stop",
+            attach_command: None,
+        };
+        let lines = kept_server_notice_lines(&[socket_override], "0.10.0");
+        assert_eq!(
+            lines[3],
+            "when your agents are idle, run `herdr server stop`, then herdr with the same socket override."
+        );
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3734,9 +4226,11 @@ mod tests {
         );
         let manifest: UpdateManifest = serde_json::from_str(&json).unwrap();
 
-        assert!(release_info_from_manifest(&manifest)
-            .unwrap_err()
-            .contains("missing a SHA-256 checksum"));
+        assert!(
+            release_info_from_manifest(&manifest, &Version::current(), false)
+                .unwrap_err()
+                .contains("missing a SHA-256 checksum")
+        );
     }
 
     #[test]
@@ -3764,7 +4258,7 @@ mod tests {
 
         let manifest: UpdateManifest = serde_json::from_str(&json).unwrap();
         handle_manifest_announcement(&manifest.version, manifest.announcement.as_ref());
-        let release = release_info_from_manifest(&manifest)
+        let release = release_info_from_manifest(&manifest, &Version::current(), false)
             .unwrap()
             .expect("release info");
 
@@ -3825,7 +4319,7 @@ mod tests {
         );
         let manifest: PreviewManifest = serde_json::from_str(&json).unwrap();
 
-        let release = release_info_from_preview_manifest(&manifest)
+        let release = release_info_from_preview_manifest(&manifest, None)
             .unwrap()
             .expect("preview update");
 

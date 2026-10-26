@@ -93,6 +93,26 @@ pub(crate) fn jj_space_metadata(cwd: &Path) -> Option<JjSpaceMetadata> {
     })
 }
 
+/// Whether `path` is still a checkout root of the repository `repo_key`, using
+/// the same backend identity that discovered it.
+pub(crate) fn checkout_root_matches(
+    backend: WorktreeBackendConfig,
+    path: &Path,
+    repo_key: &str,
+) -> bool {
+    let canonical_path = canonical_or_original(path);
+    match backend {
+        WorktreeBackendConfig::Git => {
+            crate::workspace::git_space_metadata(path).is_some_and(|space| {
+                space.key == repo_key && space.checkout_key == canonical_path.display().to_string()
+            })
+        }
+        WorktreeBackendConfig::Jj => jj_space_metadata(path).is_some_and(|space| {
+            space.key == repo_key && canonical_or_original(&space.workspace_root) == canonical_path
+        }),
+    }
+}
+
 pub(crate) fn generated_checkout_name(seed: u64, backend: WorktreeBackendConfig) -> String {
     let name = generated_branch_slug(seed);
     match backend {
@@ -578,6 +598,8 @@ pub(crate) fn list_existing_worktrees(
     repo_root: &Path,
     trust_repository: bool,
 ) -> Result<Vec<ExistingWorktree>, String> {
+    #[cfg(test)]
+    test_list_gate::wait(repo_root);
     let output = repository_git_command(repo_root, trust_repository)
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -594,6 +616,47 @@ pub(crate) fn list_existing_worktrees(
     } else {
         stderr
     })
+}
+
+#[cfg(test)]
+pub(crate) mod test_list_gate {
+    use std::path::{Path, PathBuf};
+    use std::sync::{mpsc, Mutex};
+
+    struct Gate {
+        path: PathBuf,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    static GATES: Mutex<Vec<Gate>> = Mutex::new(Vec::new());
+
+    pub(crate) fn block(path: &Path) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, entry_rx) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        GATES.lock().unwrap().push(Gate {
+            path: super::canonical_or_original(path),
+            entered,
+            release,
+        });
+        (entry_rx, release_tx)
+    }
+
+    pub(super) fn wait(path: &Path) {
+        let gate = {
+            let mut gates = GATES.lock().unwrap();
+            gates
+                .iter()
+                .position(|gate| gate.path == super::canonical_or_original(path))
+                .map(|index| gates.remove(index))
+        };
+        if let Some(gate) = gate {
+            gate.entered.send(()).unwrap();
+            gate.release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("test must release worktree discovery without blocking the server loop");
+        }
+    }
 }
 
 fn worktree_list_contains_path(

@@ -23,7 +23,7 @@ mod config;
 mod copy_mode;
 mod detect;
 mod events;
-mod ghostty;
+use ghostty_vt as ghostty;
 mod handoff_runtime;
 mod input;
 mod integration;
@@ -34,10 +34,11 @@ mod logging;
 mod metadata_tokens;
 mod noninteractive_process;
 mod pane;
-mod pane_graphics_files;
+use ghostty_vt::pane_graphics_files;
 mod persist;
 mod platform;
 mod plugin_command;
+mod plugin_installations;
 mod plugin_paths;
 mod popup_size;
 mod product_announcements;
@@ -58,6 +59,7 @@ mod terminal_effects;
 mod terminal_modes;
 mod terminal_notify;
 mod terminal_theme;
+mod thread_spawn;
 mod ui;
 mod update;
 mod workspace;
@@ -224,6 +226,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Size of the virtual terminal used when no client is attached.
 # Attached clients always use their own terminal size.
 [server]
+# Windows only: allow ordinary same-account clients to control an elevated server.
+# Requires a server restart.
+# allow_unelevated_clients = false
 # headless_cols = 120
 # headless_rows = 40
 
@@ -395,6 +400,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Resume supported AI-agent panes into their native conversation sessions after
 # a Herdr server restart. Requires official integrations that report session refs.
 # resume_agents_on_restore = true
+# Milliseconds between automatic agent restores; 0 starts them without spacing.
+# startup_per_agent_delay_ms = 100
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
@@ -512,6 +519,10 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    #[cfg(windows)]
+    if let Some(result) = platform::maybe_activate_desktop_notification(&raw_args) {
+        return result;
+    }
     if let Some(outcome) = cli::maybe_run_machine(&raw_args) {
         return finish_cli(outcome);
     }

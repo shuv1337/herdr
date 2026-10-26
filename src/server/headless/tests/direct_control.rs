@@ -149,7 +149,6 @@ fn shell_activity_takes_over_direct_control_and_restores_geometry() {
                                 },
                                 respond_to,
                                 response_write_complete: None,
-                                stream_active: None,
                             }
                         ));
                         assert!(serde_json::from_str::<api::schema::SuccessResponse>(
@@ -238,7 +237,6 @@ fn shell_request(server: &mut HeadlessServer, method: api::schema::Method) -> St
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         },
     );
     response.try_recv().unwrap()
@@ -526,7 +524,6 @@ fn passive_or_rejected_shell_activity_does_not_take_over_direct_control() {
                     },
                     respond_to,
                     response_write_complete: None,
-                    stream_active: None,
                 },
             );
             assert!(

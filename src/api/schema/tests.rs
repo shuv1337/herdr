@@ -1482,3 +1482,9 @@ fn legacy_ping_response_omits_optional_peer_session_identity() {
     let json = serde_json::to_value(response).unwrap();
     assert!(json["result"].get("session_name").is_none());
 }
+
+#[test]
+fn read_choices_cover_every_api_value() {
+    crate::cli::projection::assert_choices_cover_api_enum(READ_SOURCES);
+    crate::cli::projection::assert_choices_cover_api_enum(READ_FORMATS);
+}
