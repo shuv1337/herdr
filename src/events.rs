@@ -66,6 +66,7 @@ pub struct WorktreeReadResult {
 
 #[derive(Debug)]
 pub(crate) struct WorktreeReadData {
+    pub backend: crate::config::WorktreeBackendConfig,
     pub source_checkout_path: std::path::PathBuf,
     pub source_repo_root: std::path::PathBuf,
     pub repo_key: String,

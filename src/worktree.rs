@@ -93,6 +93,26 @@ pub(crate) fn jj_space_metadata(cwd: &Path) -> Option<JjSpaceMetadata> {
     })
 }
 
+/// Whether `path` is still a checkout root of the repository `repo_key`, using
+/// the same backend identity that discovered it.
+pub(crate) fn checkout_root_matches(
+    backend: WorktreeBackendConfig,
+    path: &Path,
+    repo_key: &str,
+) -> bool {
+    let canonical_path = canonical_or_original(path);
+    match backend {
+        WorktreeBackendConfig::Git => {
+            crate::workspace::git_space_metadata(path).is_some_and(|space| {
+                space.key == repo_key && space.checkout_key == canonical_path.display().to_string()
+            })
+        }
+        WorktreeBackendConfig::Jj => jj_space_metadata(path).is_some_and(|space| {
+            space.key == repo_key && canonical_or_original(&space.workspace_root) == canonical_path
+        }),
+    }
+}
+
 pub(crate) fn generated_checkout_name(seed: u64, backend: WorktreeBackendConfig) -> String {
     let name = generated_branch_slug(seed);
     match backend {

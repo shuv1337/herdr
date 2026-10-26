@@ -33,12 +33,24 @@ pub(crate) fn launch_server_daemon_command(
     command: &mut std::process::Command,
 ) -> std::io::Result<ServerDaemon> {
     #[cfg(target_os = "macos")]
-    match super::macos::spawn_launchd_job(command) {
-        Ok(_label) => return Ok(ServerDaemon::Launchd),
-        Err(err) => {
-            tracing::info!(%err, "starting the server directly instead of through launchd");
+    {
+        let launched = super::macos::spawn_launchd_job(command);
+        // Only the launchd job needs the log path; a direct child already owns its stderr.
+        command.env_remove(super::macos::STARTUP_STDERR_LOG_ENV);
+        match launched {
+            Ok(_label) => return Ok(ServerDaemon::Launchd),
+            Err(err) => {
+                tracing::info!(%err, "starting the server directly instead of through launchd");
+            }
         }
     }
+    spawn_server_daemon_child(command)
+}
+
+/// Spawns the daemon as a direct child whose exit status stays observable.
+pub(crate) fn spawn_server_daemon_child(
+    command: &mut std::process::Command,
+) -> std::io::Result<ServerDaemon> {
     command
         .spawn()
         .map(ServerDaemon::Child)

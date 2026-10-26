@@ -370,6 +370,8 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
+#[cfg(all(test, unix))]
+pub(crate) use unix_common::spawn_server_daemon_child;
 #[cfg(unix)]
 pub(crate) use unix_common::{launch_server_daemon_command, ServerDaemon};
 
@@ -396,6 +398,9 @@ pub(crate) fn configure_server_daemon_stderr(
         .append(true)
         .open(log_path)?;
     command.stderr(log);
+    // A launchd job cannot inherit Command's stdio either; it opens the log by path.
+    #[cfg(target_os = "macos")]
+    command.env(macos::STARTUP_STDERR_LOG_ENV, log_path);
     // WMI creates the process independently and cannot inherit Command's stdio.
     // The server must reopen its own stderr before any startup diagnostics.
     #[cfg(windows)]

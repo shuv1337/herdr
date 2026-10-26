@@ -630,7 +630,7 @@ mod tests {
             .arg("-c")
             .arg("printf 'startup bind failed\\n' >&2; exit 23");
         crate::platform::configure_server_daemon_stderr(&mut command, &log_path).unwrap();
-        let mut daemon = crate::platform::launch_server_daemon_command(&mut command).unwrap();
+        let mut daemon = crate::platform::spawn_server_daemon_child(&mut command).unwrap();
         let started = std::time::Instant::now();
         let result = wait_for_startup(
             &dir.join("client.sock"),
@@ -687,7 +687,7 @@ mod tests {
             .arg(&marker)
             .stderr(std::process::Stdio::null());
         capture_server_daemon_stderr(&mut command, &log_path);
-        let mut daemon = crate::platform::launch_server_daemon_command(&mut command).unwrap();
+        let mut daemon = crate::platform::spawn_server_daemon_child(&mut command).unwrap();
         let started = std::time::Instant::now();
         let status = loop {
             if let Some(status) = daemon.try_wait().unwrap() {
@@ -709,13 +709,47 @@ mod tests {
     fn startup_review_spawn_failure_says_process_was_not_started() {
         let dir = unique_test_dir("missing-startup-executable");
         let mut command = Command::new(dir.join("missing-herdr"));
-        let error = match crate::platform::launch_server_daemon_command(&mut command) {
+        let error = match crate::platform::spawn_server_daemon_child(&mut command) {
             Ok(_) => panic!("missing executable cannot start"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains("server process was not started"));
         assert!(!error.to_string().contains("check"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_receipt_waits_on_socket_readiness_without_exit_status() {
+        let mut daemon = crate::platform::ServerDaemon::Launchd;
+        assert_eq!(daemon.pid(), 0);
+        for becomes_ready in [true, false] {
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let result = wait_for_startup(
+                Path::new("/lab/client.sock"),
+                Path::new("/lab/herdr-server.log"),
+                Duration::from_secs(5),
+                StartupReadiness {
+                    client_ready: || Ok(becomes_ready && elapsed.get() >= Duration::from_secs(1)),
+                    api_listening: |_| false,
+                },
+                || {
+                    daemon
+                        .try_wait()
+                        .map(|status| status.map(|status| status.to_string()))
+                },
+                || elapsed.get(),
+                |delay| elapsed.set(elapsed.get() + delay),
+            );
+            if becomes_ready {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(elapsed.get(), Duration::from_secs(1));
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert!(error.to_string().contains("may still be starting"));
+            }
+        }
     }
 
     #[test]

@@ -32,7 +32,7 @@ mod power;
 pub(crate) use power::monitor_host_power;
 
 mod launchd_spawn;
-pub(crate) use launchd_spawn::{leave_launchd_job, spawn_launchd_job};
+pub(crate) use launchd_spawn::{leave_launchd_job, spawn_launchd_job, STARTUP_STDERR_LOG_ENV};
 
 #[cfg(test)]
 mod config_file_tests;

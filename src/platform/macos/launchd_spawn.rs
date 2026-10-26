@@ -21,6 +21,8 @@ const LAUNCHCTL: &str = "/bin/launchctl";
 const LABEL_PREFIX: &str = "dev.herdr.server.";
 /// Tells the job process to fork the server and exit; never inherited by panes.
 const DETACH_ENV: &str = "HERDR_LAUNCHD_DETACH";
+/// Startup log for the job's stderr. Consumed by the plist; never passed to the server.
+pub(crate) const STARTUP_STDERR_LOG_ENV: &str = "HERDR_STARTUP_STDERR_LOG";
 /// Finished jobs stay loaded until logout; older ones are removed on the next launch.
 const STALE_JOB_AGE: Duration = Duration::from_secs(60);
 
@@ -222,9 +224,16 @@ fn job_plist(
         push_key(&mut plist, OsStr::new("WorkingDirectory"))?;
         push_string(&mut plist, dir.as_os_str())?;
     }
-    for key in ["StandardInPath", "StandardOutPath", "StandardErrorPath"] {
+    for key in ["StandardInPath", "StandardOutPath"] {
         push_key_string(&mut plist, key, "/dev/null")?;
     }
+    // A Command's stderr descriptor cannot cross into a launchd job, so the
+    // startup log travels as a path. launchd opens it for appending.
+    push_key(&mut plist, OsStr::new("StandardErrorPath"))?;
+    push_string(
+        &mut plist,
+        startup_stderr_log(command).unwrap_or(OsStr::new("/dev/null")),
+    )?;
     // Run once and never restart. The forked server must survive the job
     // process exiting, and keeps normal scheduling priority.
     plist.push_str(concat!(
@@ -238,11 +247,20 @@ fn job_plist(
     Ok(plist)
 }
 
+fn startup_stderr_log(command: &Command) -> Option<&OsStr> {
+    command
+        .get_envs()
+        .find(|(key, _)| *key == STARTUP_STDERR_LOG_ENV)
+        .and_then(|(_, value)| value)
+}
+
 fn resolved_environment(command: &Command) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    let mut env: Vec<_> = std::env::vars_os().collect();
+    let mut env: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| key != STARTUP_STDERR_LOG_ENV)
+        .collect();
     for (key, value) in command.get_envs() {
         env.retain(|(existing, _)| existing != key);
-        if let Some(value) = value {
+        if let Some(value) = value.filter(|_| key != STARTUP_STDERR_LOG_ENV) {
             env.push((key.to_os_string(), value.to_os_string()));
         }
     }
@@ -341,6 +359,23 @@ mod tests {
         assert!(plist.contains("<key>KeepAlive</key>\n<false/>"));
         assert!(plist.contains("<key>WorkingDirectory</key>\n<string>/tmp</string>"));
         assert!(plist.contains("<key>Umask</key>\n<integer>63</integer>"));
+        assert!(plist.contains("<key>StandardErrorPath</key>\n<string>/dev/null</string>"));
+    }
+
+    #[test]
+    fn plist_sends_stderr_to_the_startup_log_without_exporting_it() {
+        let mut command = Command::new("/bin/true");
+        command.env(
+            STARTUP_STDERR_LOG_ENV,
+            "/var/log/herdr & co/herdr-server.log",
+        );
+        let plist = job_plist("dev.herdr.server.1.2", &command, None, 0o022).expect("plist");
+
+        assert!(plist.contains(
+            "<key>StandardErrorPath</key>\n<string>/var/log/herdr &amp; co/herdr-server.log</string>"
+        ));
+        assert!(plist.contains("<key>StandardOutPath</key>\n<string>/dev/null</string>"));
+        assert!(!plist.contains(&format!("<key>{STARTUP_STDERR_LOG_ENV}</key>")));
     }
 
     #[test]

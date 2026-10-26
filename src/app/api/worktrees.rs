@@ -87,6 +87,7 @@ impl App {
         &mut self,
         id: String,
         params: WorktreeOpenParams,
+        backend: crate::config::WorktreeBackendConfig,
         mut source: WorktreeSource,
         entry: crate::worktree::ExistingWorktree,
     ) -> String {
@@ -94,12 +95,7 @@ impl App {
             return encode_error(id, "worktree_not_found", "worktree cannot be opened");
         }
         let canonical_path = crate::worktree::canonical_or_original(&entry.path);
-        let target_matches =
-            crate::workspace::git_space_metadata(&entry.path).is_some_and(|space| {
-                space.key == source.repo_key
-                    && space.checkout_key == canonical_path.display().to_string()
-            });
-        if !target_matches {
+        if !crate::worktree::checkout_root_matches(backend, &entry.path, &source.repo_key) {
             return encode_error(
                 id,
                 "worktree_not_found",
@@ -1697,6 +1693,83 @@ mod tests {
                 .workspaces
                 .iter()
                 .all(|ws| ws.worktree_space().is_none()));
+            app.state.assert_invariants_for_test();
+            let _ = std::fs::remove_dir_all(checkout);
+            let _ = std::fs::remove_dir_all(repo);
+        }
+    }
+
+    fn jj_available() -> bool {
+        std::process::Command::new("jj")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    #[tokio::test]
+    async fn deferred_jj_worktree_open_validates_target_with_jj_identity() {
+        if !jj_available() {
+            return;
+        }
+        for colocate in [true, false] {
+            let repo = if colocate {
+                create_committed_repo("api-jj-open-colocated")
+            } else {
+                let repo = unique_temp_path("api-jj-open-native");
+                std::fs::create_dir_all(&repo).unwrap();
+                repo
+            };
+            let init = std::process::Command::new("jj")
+                .args(["git", "init"])
+                .arg(if colocate {
+                    "--colocate"
+                } else {
+                    "--no-colocate"
+                })
+                .arg(&repo)
+                .output()
+                .unwrap();
+            assert!(init.status.success(), "jj git init: {init:?}");
+            let checkout = unique_temp_path("api-jj-open-workspace");
+            crate::worktree::run_checkout_add_command(
+                crate::config::WorktreeBackendConfig::Jj,
+                &repo,
+                &checkout,
+                "herdr-open",
+                "@",
+                false,
+            )
+            .unwrap();
+            let mut app = app_with_parent(&repo);
+            app.state.worktree_backend = crate::config::WorktreeBackendConfig::Jj;
+            let source_id = app.state.workspaces[0].id.clone();
+
+            let response = run_deferred_api_request(
+                &mut app,
+                Request {
+                    id: "jj-open".into(),
+                    method: crate::api::schema::Method::WorktreeOpen(WorktreeOpenParams {
+                        workspace_id: Some(source_id),
+                        path: Some(checkout.display().to_string()),
+                        ..Default::default()
+                    }),
+                },
+            );
+            let response: SuccessResponse = serde_json::from_str(&response)
+                .unwrap_or_else(|err| panic!("colocate={colocate}: {err}: {response}"));
+            let crate::api::schema::ResponseResult::WorktreeOpened { already_open, .. } =
+                response.result
+            else {
+                panic!(
+                    "colocate={colocate}: unexpected response {:?}",
+                    response.result
+                );
+            };
+            assert!(!already_open, "colocate={colocate}");
+            assert_eq!(app.state.workspaces.len(), 2, "colocate={colocate}");
+            assert!(app.state.workspaces[1]
+                .worktree_space()
+                .is_some_and(|space| space.is_linked_worktree));
             app.state.assert_invariants_for_test();
             let _ = std::fs::remove_dir_all(checkout);
             let _ = std::fs::remove_dir_all(repo);

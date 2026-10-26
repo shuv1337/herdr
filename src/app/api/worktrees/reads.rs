@@ -245,6 +245,7 @@ impl App {
                             )?];
                         }
                         Ok(WorktreeReadData {
+                            backend,
                             source_checkout_path: source.source_checkout_path,
                             source_repo_root: source.source_repo_root,
                             repo_key: source.repo_key,
@@ -323,6 +324,7 @@ impl App {
                     Method::WorktreeOpen(params) => self.finish_worktree_open(
                         result.request.id,
                         params,
+                        data.backend,
                         source,
                         data.entries
                             .into_iter()
